@@ -4,7 +4,7 @@
     .fingerprint = 0x5a2a0eadb1367749,
     .dependencies = .{
         .@"zig-stable-array" = .{
-            .url = "https://github.com/rdunnington/zig-stable-array/archive/9cdccbb42f56305eec9c8090f7123c99bc0e6793.tar.gz",
+            .url = "git+https://github.com/rdunnington/zig-stable-array.git?branch=zig-0.14.0#9cdccbb42f56305eec9c8090f7123c99bc0e6793",
             .hash = "stable_array-0.1.0-3ihgvfZaAADfEtMl2cUuB-Owkfa_F6fWHaaJltcXM2T6",
         },
     },
