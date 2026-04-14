@@ -1,6 +1,4 @@
 const std = @import("std");
-const CrossTarget = std.zig.CrossTarget;
-
 const Build = std.Build;
 const Module = Build.Module;
 const Import = Module.Import;
@@ -185,15 +183,15 @@ pub fn build(b: *Build) void {
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
         .use_llvm = use_llvm,
     });
-    cffi_test.addCSourceFile(.{
+    cffi_test.root_module.addCSourceFile(.{
         .file = b.path("test/cffi/main.c"),
     });
-    cffi_test.addIncludePath(b.path("src/bytebox.h"));
-    cffi_test.linkLibC();
-    cffi_test.linkLibrary(lib_bytebox);
+    cffi_test.root_module.addIncludePath(b.path("src/bytebox.h"));
+    cffi_test.root_module.linkLibrary(lib_bytebox);
 
     const ffi_guest: WasmBuild = buildWasmExe(b, "test/cffi/module.zig", .wasm32);
 
