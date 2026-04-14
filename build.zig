@@ -34,13 +34,22 @@ const WasmBuild = struct {
     install: *Step,
 };
 
+// At the time of this writing, zig's stage2 codegen backend can't handle tailcalls, so we'll default to using LLVM for simplicity
+const use_llvm = true;
+
 pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const enable_metering = b.option(bool, "meter", "Enable metering") orelse false;
-    const enable_debug_trace = b.option(bool, "debug_trace", "Enable debug tracing feature") orelse false;
-    const enable_debug_trap = b.option(bool, "debug_trap", "Enable debug trap features") orelse false;
+    const enable_metering = b.option(bool, "meter", "Enable metering (default: false)") orelse false;
+    const enable_debug_trace = b.option(bool, "debug_trace", "Enable debug tracing feature (default: false)") orelse false;
+    const enable_debug_trap = b.option(bool, "debug_trap", "Enable debug trap features (default: false)") orelse false;
+    const enable_wasi = b.option(bool, "wasi", "Enable wasi support (default: true if target has support)") orelse blk: {
+        if (target.result.cpu.arch.isWasm() and target.result.os.tag != .wasi) {
+            break :blk false;
+        }
+        break :blk true;
+    };
     const vm_kind = b.option(
         StackVmKind,
         "vm_kind",
@@ -51,6 +60,7 @@ pub fn build(b: *Build) void {
     options.addOption(bool, "enable_metering", enable_metering);
     options.addOption(bool, "enable_debug_trace", enable_debug_trace);
     options.addOption(bool, "enable_debug_trap", enable_debug_trap);
+    options.addOption(bool, "enable_wasi", enable_wasi);
     options.addOption(StackVmKind, "vm_kind", vm_kind);
 
     const stable_array = b.dependency("stable_array", .{
@@ -103,11 +113,15 @@ pub fn build(b: *Build) void {
         .options = options,
     });
 
-    const lib_bytebox: *Compile = b.addStaticLibrary(.{
+    const lib_bytebox: *Compile = b.addLibrary(.{
         .name = "bytebox",
-        .root_source_file = b.path("src/cffi.zig"),
-        .target = target,
-        .optimize = optimize,
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cffi.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = use_llvm,
     });
     lib_bytebox.root_module.addImport(stable_array_import.name, stable_array_import.module);
     lib_bytebox.root_module.addOptions("config", options);
@@ -116,9 +130,12 @@ pub fn build(b: *Build) void {
 
     // Unit tests
     const unit_tests: *Compile = b.addTest(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = use_llvm,
     });
     unit_tests.root_module.addImport(stable_array_import.name, stable_array_import.module);
     unit_tests.root_module.addOptions("config", options);
@@ -140,12 +157,15 @@ pub fn build(b: *Build) void {
     });
 
     // wasi tests
-    const wasi_testsuite = b.addSystemCommand(&.{"python3"});
-    wasi_testsuite.addArg("test/wasi/run.py");
-    wasi_testsuite.step.dependOn(bytebox_exe_step);
+    var maybe_wasi_testsuite_step: ?*Step = null;
+    if (enable_wasi) {
+        const wasi_testsuite = b.addSystemCommand(&.{"python3"});
+        wasi_testsuite.addArg("test/wasi/run.py");
+        wasi_testsuite.step.dependOn(bytebox_exe_step);
 
-    const wasi_testsuite_step = b.step("test-wasi", "Run wasi testsuite");
-    wasi_testsuite_step.dependOn(&wasi_testsuite.step);
+        maybe_wasi_testsuite_step = b.step("test-wasi", "Run wasi testsuite");
+        maybe_wasi_testsuite_step.?.dependOn(&wasi_testsuite.step);
+    }
 
     // mem64 test
     const compile_mem64_test: WasmBuild = buildWasmExe(b, "test/mem64/memtest.zig", .wasm64);
@@ -160,40 +180,49 @@ pub fn build(b: *Build) void {
     });
 
     // Cffi test
-    const cffi_test_step = b.step("test-cffi", "Run cffi test");
-    const cffi_build = b.addExecutable(.{
+    const cffi_test = b.addExecutable(.{
         .name = "test-cffi",
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = use_llvm,
     });
-    cffi_build.addCSourceFile(.{
+    cffi_test.addCSourceFile(.{
         .file = b.path("test/cffi/main.c"),
     });
-    cffi_build.addIncludePath(b.path("src/bytebox.h"));
-    cffi_build.linkLibC();
-    cffi_build.linkLibrary(lib_bytebox);
+    cffi_test.addIncludePath(b.path("src/bytebox.h"));
+    cffi_test.linkLibC();
+    cffi_test.linkLibrary(lib_bytebox);
 
     const ffi_guest: WasmBuild = buildWasmExe(b, "test/cffi/module.zig", .wasm32);
 
-    const cffi_run_step = b.addRunArtifact(cffi_build);
+    const cffi_run_step = b.addRunArtifact(cffi_test);
     cffi_run_step.addFileArg(ffi_guest.compile.getEmittedBin());
+
+    const cffi_test_step = b.step("test-cffi", "Run cffi test");
     cffi_test_step.dependOn(&cffi_run_step.step);
 
     // All tests
     const all_tests_step = b.step("test", "Run unit, wasm, and wasi tests");
     all_tests_step.dependOn(unit_test_step);
     all_tests_step.dependOn(wasm_testsuite_step);
-    all_tests_step.dependOn(wasi_testsuite_step);
     all_tests_step.dependOn(mem64_test_step);
     all_tests_step.dependOn(cffi_test_step);
+    if (maybe_wasi_testsuite_step) |wasi_testsuite_step| {
+        all_tests_step.dependOn(wasi_testsuite_step);
+    }
 }
 
-fn buildExeWithRunStep(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Mode, imports: []const Import, opts: ExeOpts) *Build.Step {
+fn buildExeWithRunStep(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, imports: []const Import, opts: ExeOpts) *Build.Step {
     const exe: *Compile = b.addExecutable(.{
         .name = opts.exe_name,
-        .root_source_file = b.path(opts.root_src),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(opts.root_src),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = use_llvm,
     });
 
     for (imports) |import| {
@@ -251,9 +280,12 @@ fn buildWasmExe(b: *Build, filepath: []const u8, comptime arch: WasmArch) WasmBu
 
     var exe = b.addExecutable(.{
         .name = filename_no_extension,
-        .root_source_file = b.path(filepath),
-        .target = b.resolveTargetQuery(target_query),
-        .optimize = .ReleaseSmall,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(filepath),
+            .target = b.resolveTargetQuery(target_query),
+            .optimize = .ReleaseSmall,
+        }),
+        .use_llvm = use_llvm,
     });
     exe.rdynamic = true;
     exe.entry = .disabled;

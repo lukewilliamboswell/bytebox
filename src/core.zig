@@ -5,7 +5,7 @@ const inst = @import("instance.zig");
 const vm_stack = @import("vm_stack.zig");
 const vm_register = @import("vm_register.zig");
 pub const config = @import("config");
-pub const wasi = @import("wasi.zig");
+pub const wasi = if (config.enable_wasi) @import("wasi.zig") else void;
 
 pub const LogLevel = common.LogLevel;
 pub const Logger = common.Logger;
@@ -36,6 +36,7 @@ pub const ModuleDefinitionOpts = def.ModuleDefinitionOpts;
 pub const TaggedVal = def.TaggedVal;
 pub const Val = def.Val;
 pub const ValType = def.ValType;
+pub const ExternRef = def.ExternRef;
 
 pub const UnlinkableError = inst.UnlinkableError;
 pub const UninstantiableError = inst.UninstantiableError;

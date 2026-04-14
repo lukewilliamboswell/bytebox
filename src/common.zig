@@ -4,26 +4,6 @@ const std = @import("std");
 
 pub const StableArray = @import("stable-array").StableArray;
 
-pub fn decodeLEB128(comptime T: type, reader: anytype) !T {
-    if (@typeInfo(T).int.signedness == .signed) {
-        return std.leb.readILEB128(T, reader) catch |e| {
-            if (e == error.Overflow) {
-                return error.MalformedLEB128;
-            } else {
-                return e;
-            }
-        };
-    } else {
-        return std.leb.readULEB128(T, reader) catch |e| {
-            if (e == error.Overflow) {
-                return error.MalformedLEB128;
-            } else {
-                return e;
-            }
-        };
-    }
-}
-
 pub const LogLevel = enum(c_int) {
     Info,
     Error,
@@ -48,12 +28,20 @@ pub const Logger = struct {
 
     fn defaultLog(level: LogLevel, text: [:0]const u8) void {
         var fd = switch (level) {
-            .Info => std.io.getStdOut(),
-            .Error => std.io.getStdErr(),
+            .Info => std.fs.File.stdout(),
+            .Error => std.fs.File.stderr(),
         };
-        var writer = fd.writer();
-        nosuspend writer.writeAll(text) catch |e| {
+
+        var buffer: [1024]u8 = undefined;
+        var writer = fd.writer(&buffer);
+        const w: *std.io.Writer = &writer.interface;
+
+        nosuspend w.writeAll(text) catch |e| {
             std.debug.print("Failed logging due to error: {}\n", .{e});
+        };
+
+        nosuspend w.flush() catch |e| {
+            std.debug.print("Failed flushing log due to error: {}\n", .{e});
         };
     }
 

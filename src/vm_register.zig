@@ -1,9 +1,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const AllocError = std.mem.Allocator.Error;
 
 const builtin = @import("builtin");
-
-const AllocError = std.mem.Allocator.Error;
 
 const common = @import("common.zig");
 const StableArray = common.StableArray;
@@ -55,6 +54,8 @@ const FuncRef = def.FuncRef;
 
 const inst = @import("instance.zig");
 const VM = inst.VM;
+const InstantiateError = inst.InstantiateError;
+const TrapError = inst.TrapError;
 const ModuleInstance = inst.ModuleInstance;
 const InvokeOpts = inst.InvokeOpts;
 const ResumeInvokeOpts = inst.ResumeInvokeOpts;
@@ -223,7 +224,7 @@ const IRNode = struct {
     }
 
     // a node that has no out edges to instructions with side effects or control flow
-    fn isIsland(node: *IRNode, unvisited: *std.ArrayList(*IRNode)) AllocError!bool {
+    fn isIsland(node: *IRNode, unvisited: *std.array_list.Managed(*IRNode)) AllocError!bool {
         if (node.opcode == .Return) {
             return false;
         }
@@ -256,12 +257,12 @@ const RegisterSlots = struct {
         prev: ?u32,
     };
 
-    slots: std.ArrayList(Slot),
+    slots: std.array_list.Managed(Slot),
     last_free: ?u32,
 
     fn init(allocator: std.mem.Allocator) RegisterSlots {
         return RegisterSlots{
-            .slots = std.ArrayList(Slot).init(allocator),
+            .slots = std.array_list.Managed(Slot).init(allocator),
             .last_free = null,
         };
     }
@@ -332,7 +333,7 @@ const IRFunction = struct {
         var slots = RegisterSlots.init(allocator);
         defer slots.deinit();
 
-        var visit_queue = std.ArrayList(*IRNode).init(allocator);
+        var visit_queue = std.array_list.Managed(*IRNode).init(allocator);
         defer visit_queue.deinit();
         try visit_queue.append(func.ir_root);
 
@@ -367,7 +368,7 @@ const IRFunction = struct {
         }
     }
 
-    fn codegen(func: *IRFunction, instructions: *std.ArrayList(RegInstruction), module_def: ModuleDefinition, allocator: std.mem.Allocator) AllocError!void {
+    fn codegen(func: *IRFunction, instructions: *std.array_list.Managed(RegInstruction), module_def: ModuleDefinition, allocator: std.mem.Allocator) AllocError!void {
         // walk the graph in breadth-first order
 
         // when a node is visited, emit its instruction
@@ -375,7 +376,7 @@ const IRFunction = struct {
 
         const start_instruction_offset = instructions.items.len;
 
-        var visit_queue = std.ArrayList(*IRNode).init(allocator);
+        var visit_queue = std.array_list.Managed(*IRNode).init(allocator);
         defer visit_queue.deinit();
         try visit_queue.append(func.ir_root);
 
@@ -419,14 +420,14 @@ const IRFunction = struct {
     }
 
     fn dumpVizGraph(func: IRFunction, path: []u8, module_def: ModuleDefinition, allocator: std.mem.Allocator) !void {
-        var graph_txt = std.ArrayList(u8).init(allocator);
+        var graph_txt = std.array_list.Managed(u8).init(allocator);
         defer graph_txt.deinit();
         try graph_txt.ensureTotalCapacity(1024 * 16);
 
         var writer = graph_txt.writer();
         _ = try writer.write("digraph {\n");
 
-        var nodes = std.ArrayList(*const IRNode).init(allocator);
+        var nodes = std.array_list.Managed(*const IRNode).init(allocator);
         defer nodes.deinit();
         try nodes.ensureTotalCapacity(1024);
         nodes.appendAssumeCapacity(func.ir_root);
@@ -493,9 +494,9 @@ const ModuleIR = struct {
             phi_nodes: []*IRNode,
         };
 
-        nodes: std.ArrayList(*IRNode),
-        blocks: std.ArrayList(Block),
-        phi_nodes: std.ArrayList(*IRNode),
+        nodes: std.array_list.Managed(*IRNode),
+        blocks: std.array_list.Managed(Block),
+        phi_nodes: std.array_list.Managed(*IRNode),
 
         // const ContinuationType = enum {
         //     .Normal,
@@ -504,9 +505,9 @@ const ModuleIR = struct {
 
         fn init(allocator: std.mem.Allocator) BlockStack {
             return BlockStack{
-                .nodes = std.ArrayList(*IRNode).init(allocator),
-                .blocks = std.ArrayList(Block).init(allocator),
-                .phi_nodes = std.ArrayList(*IRNode).init(allocator),
+                .nodes = std.array_list.Managed(*IRNode).init(allocator),
+                .blocks = std.array_list.Managed(Block).init(allocator),
+                .phi_nodes = std.array_list.Managed(*IRNode).init(allocator),
             };
         }
 
@@ -570,19 +571,19 @@ const ModuleIR = struct {
 
         allocator: std.mem.Allocator,
 
-        // all_nodes: std.ArrayList(*IRNode),
+        // all_nodes: std.array_list.Managed(*IRNode),
 
         blocks: BlockStack,
 
         // This stack is a record of the nodes to push values onto the stack. If an instruction would push
         // multiple values onto the stack, it would be in this list as many times as values it pushed. Note
         // that we don't have to do any type checking here because the module has already been validated.
-        value_stack: std.ArrayList(*IRNode),
+        value_stack: std.array_list.Managed(*IRNode),
 
         // records the current block continuation
-        // label_continuations: std.ArrayList(u32),
+        // label_continuations: std.array_list.Managed(u32),
 
-        pending_continuation_edges: std.ArrayList(PendingContinuationEdge),
+        pending_continuation_edges: std.array_list.Managed(PendingContinuationEdge),
 
         // when hitting an unconditional control transfer, we need to mark the rest of the stack values as unreachable just like in validation
         is_unreachable: bool,
@@ -591,27 +592,27 @@ const ModuleIR = struct {
         // we need a way to represent what's in the locals slot as an SSA node. This array lets us do that. We also
         // reuse the Local_Get instructions to indicate the "initial value" of the slot. Since our IRNode only stores
         // indices to instructions, we'll just lazily set these when they're fetched for the first time.
-        locals: std.ArrayList(?*IRNode),
+        locals: std.array_list.Managed(?*IRNode),
 
         // Lets us collapse multiple const IR nodes with the same type/value into a single one
         unique_constants: UniqueValueToIRNodeMap,
 
-        scratch_node_list_1: std.ArrayList(*IRNode),
-        scratch_node_list_2: std.ArrayList(*IRNode),
+        scratch_node_list_1: std.array_list.Managed(*IRNode),
+        scratch_node_list_2: std.array_list.Managed(*IRNode),
 
         fn init(allocator: std.mem.Allocator) IntermediateCompileData {
             return IntermediateCompileData{
                 .allocator = allocator,
-                // .all_nodes = std.ArrayList(*IRNode).init(allocator),
+                // .all_nodes = std.array_list.Managed(*IRNode).init(allocator),
                 .blocks = BlockStack.init(allocator),
-                .value_stack = std.ArrayList(*IRNode).init(allocator),
-                // .label_continuations = std.ArrayList(u32).init(allocator),
-                .pending_continuation_edges = std.ArrayList(PendingContinuationEdge).init(allocator),
+                .value_stack = std.array_list.Managed(*IRNode).init(allocator),
+                // .label_continuations = std.array_list.Managed(u32).init(allocator),
+                .pending_continuation_edges = std.array_list.Managed(PendingContinuationEdge).init(allocator),
                 .is_unreachable = false,
-                .locals = std.ArrayList(?*IRNode).init(allocator),
+                .locals = std.array_list.Managed(?*IRNode).init(allocator),
                 .unique_constants = UniqueValueToIRNodeMap.init(allocator),
-                .scratch_node_list_1 = std.ArrayList(*IRNode).init(allocator),
-                .scratch_node_list_2 = std.ArrayList(*IRNode).init(allocator),
+                .scratch_node_list_1 = std.array_list.Managed(*IRNode).init(allocator),
+                .scratch_node_list_2 = std.array_list.Managed(*IRNode).init(allocator),
             };
         }
 
@@ -712,16 +713,16 @@ const ModuleIR = struct {
 
     allocator: std.mem.Allocator,
     module_def: *const ModuleDefinition,
-    functions: std.ArrayList(IRFunction),
+    functions: std.array_list.Managed(IRFunction),
     ir: StableArray(IRNode),
 
-    // instructions: std.ArrayList(RegInstruction),
+    // instructions: std.array_list.Managed(RegInstruction),
 
     fn init(allocator: std.mem.Allocator, module_def: *const ModuleDefinition) ModuleIR {
         return ModuleIR{
             .allocator = allocator,
             .module_def = module_def,
-            .functions = std.ArrayList(IRFunction).init(allocator),
+            .functions = std.array_list.Managed(IRFunction).init(allocator),
             .ir = StableArray(IRNode).init(1024 * 1024 * 8),
         };
     }
@@ -825,7 +826,7 @@ const ModuleIR = struct {
                     try compile_data.blocks.pushBlock(instruction.immediate.Block.continuation); // TODO record the kind of block so we know this is a loop?
                 },
                 .If => {
-                    var phi_nodes: *std.ArrayList(*IRNode) = &compile_data.scratch_node_list_1;
+                    var phi_nodes: *std.array_list.Managed(*IRNode) = &compile_data.scratch_node_list_1;
                     defer compile_data.scratch_node_list_1.clearRetainingCapacity();
 
                     std.debug.assert(phi_nodes.items.len == 0);
@@ -872,7 +873,7 @@ const ModuleIR = struct {
                     // At the end of every block, we ensure all nodes with side effects are still in the graph. Order matters
                     // since mutations to the Store or control flow changes must happen in the order of the original instructions.
                     {
-                        var nodes_with_side_effects: *std.ArrayList(*IRNode) = &compile_data.scratch_node_list_1;
+                        var nodes_with_side_effects: *std.array_list.Managed(*IRNode) = &compile_data.scratch_node_list_1;
                         defer nodes_with_side_effects.clearRetainingCapacity();
 
                         const current_block_nodes: []*IRNode = compile_data.blocks.currentBlockNodes();
@@ -915,7 +916,7 @@ const ModuleIR = struct {
 
                     try compile_data.popPushValueStackNodes(node.?, 1, 0);
 
-                    // var continuation_edges: std.ArrayList(*IRNode).init(allocator);
+                    // var continuation_edges: std.array_list.Managed(*IRNode).init(allocator);
                     // defer continuation_edges.deinit();
 
                     const immediates: *const BranchTableImmediates = &mir.module_def.code.branch_table.items[instruction.immediate.Index];
@@ -1110,60 +1111,60 @@ pub const RegisterVM = struct {
         _ = vm;
     }
 
-    pub fn instantiate(vm: *VM, module: *ModuleInstance, opts: ModuleInstantiateOpts) anyerror!void {
+    pub fn instantiate(vm: *VM, module: *ModuleInstance, opts: ModuleInstantiateOpts) InstantiateError!void {
         _ = vm;
         _ = module;
         _ = opts;
-        return error.Unimplemented;
+        unreachable;
     }
 
-    pub fn invoke(vm: *VM, module: *ModuleInstance, handle: FunctionHandle, params: [*]const Val, returns: [*]Val, opts: InvokeOpts) anyerror!void {
+    pub fn invoke(vm: *VM, module: *ModuleInstance, handle: FunctionHandle, params: [*]const Val, returns: [*]Val, opts: InvokeOpts) TrapError!void {
         _ = vm;
         _ = module;
         _ = handle;
         _ = params;
         _ = returns;
         _ = opts;
-        return error.Unimplemented;
+        unreachable;
     }
 
-    pub fn invokeWithIndex(vm: *VM, module: *ModuleInstance, func_index: usize, params: [*]const Val, returns: [*]Val) anyerror!void {
+    pub fn invokeWithIndex(vm: *VM, module: *ModuleInstance, func_index: usize, params: [*]const Val, returns: [*]Val) TrapError!void {
         _ = vm;
         _ = module;
         _ = func_index;
         _ = params;
         _ = returns;
-        return error.Unimplemented;
+        unreachable;
     }
 
-    pub fn resumeInvoke(vm: *VM, module: *ModuleInstance, returns: []Val, opts: ResumeInvokeOpts) anyerror!void {
+    pub fn resumeInvoke(vm: *VM, module: *ModuleInstance, returns: []Val, opts: ResumeInvokeOpts) TrapError!void {
         _ = vm;
         _ = module;
         _ = returns;
         _ = opts;
-        return error.Unimplemented;
+        unreachable;
     }
 
-    pub fn step(vm: *VM, module: *ModuleInstance, returns: []Val) anyerror!void {
+    pub fn step(vm: *VM, module: *ModuleInstance, returns: []Val) TrapError!void {
         _ = vm;
         _ = module;
         _ = returns;
-        return error.Unimplemented;
+        unreachable;
     }
 
-    pub fn setDebugTrap(vm: *VM, module: *ModuleInstance, wasm_address: u32, mode: DebugTrapInstructionMode) anyerror!bool {
+    pub fn setDebugTrap(vm: *VM, module: *ModuleInstance, wasm_address: u32, mode: DebugTrapInstructionMode) AllocError!bool {
         _ = vm;
         _ = module;
         _ = wasm_address;
         _ = mode;
-        return error.Unimplemented;
+        unreachable;
     }
 
-    pub fn formatBacktrace(vm: *VM, indent: u8, allocator: std.mem.Allocator) anyerror!std.ArrayList(u8) {
+    pub fn formatBacktrace(vm: *VM, indent: u8, allocator: std.mem.Allocator) anyerror!std.array_list.Managed(u8) {
         _ = vm;
         _ = indent;
         _ = allocator;
-        return error.Unimplemented;
+        unreachable;
     }
 
     pub fn findFuncTypeDef(vm: *VM, module: *ModuleInstance, local_func_index: usize) *const FunctionTypeDefinition {

@@ -45,7 +45,7 @@ fn getArgSafe(index: usize, args: []const []const u8) ?[]const u8 {
     return if (index < args.len) args[index] else null;
 }
 
-fn parseCmdOpts(args: []const [:0]const u8, env_buffer: *std.ArrayList([]const u8), dir_buffer: *std.ArrayList([]const u8)) CmdOpts {
+fn parseCmdOpts(args: []const [:0]const u8, env_buffer: *std.array_list.Managed([]const u8), dir_buffer: *std.array_list.Managed([]const u8)) CmdOpts {
     var opts = CmdOpts{};
 
     if (args.len < 2) {
@@ -191,11 +191,11 @@ pub fn main() !void {
     const args: []const [:0]u8 = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var env_buffer = std.ArrayList([]const u8).init(allocator);
+    var env_buffer = std.array_list.Managed([]const u8).init(allocator);
     defer env_buffer.deinit();
     try env_buffer.ensureTotalCapacity(4096); // 4096 vars should be enough for most insane script file scenarios.
 
-    var dir_buffer = std.ArrayList([]const u8).init(allocator);
+    var dir_buffer = std.array_list.Managed([]const u8).init(allocator);
     defer dir_buffer.deinit();
     try dir_buffer.ensureTotalCapacity(4096);
 
@@ -247,7 +247,7 @@ pub fn main() !void {
     };
 
     if (opts.print_dump) {
-        var strbuf = std.ArrayList(u8).init(allocator);
+        var strbuf = std.array_list.Managed(u8).init(allocator);
         try strbuf.ensureTotalCapacity(1024 * 16);
         try module_def.dump(strbuf.writer());
         log.info("{s}", .{strbuf.items});
@@ -257,12 +257,24 @@ pub fn main() !void {
     var module_instance = try bytebox.createModuleInstance(.Stack, module_def, allocator);
     defer module_instance.destroy();
 
-    var imports_wasi: bytebox.ModuleImportPackage = try wasi.initImports(.{
-        .argv = opts.wasm_argv,
-        .env = opts.wasm_env,
-        .dirs = opts.wasm_dirs,
-    }, allocator);
-    defer wasi.deinitImports(&imports_wasi);
+    var imports_wasi: bytebox.ModuleImportPackage = blk: {
+        if (config.enable_wasi) {
+            break :blk try wasi.initImports(.{
+                .argv = opts.wasm_argv,
+                .env = opts.wasm_env,
+                .dirs = opts.wasm_dirs,
+            }, allocator);
+        } else {
+            break :blk try bytebox.ModuleImportPackage.init("empty_stub", null, null, allocator);
+        }
+    };
+    defer {
+        if (config.enable_wasi) {
+            wasi.deinitImports(&imports_wasi);
+        } else {
+            imports_wasi.deinit();
+        }
+    }
 
     const instantiate_opts = bytebox.ModuleInstantiateOpts{
         .imports = &[_]bytebox.ModuleImportPackage{imports_wasi},
@@ -289,7 +301,7 @@ pub fn main() !void {
 
     const num_params: usize = invoke_args.len;
     if (func_export.params.len != num_params) {
-        var strbuf = std.ArrayList(u8).init(allocator);
+        var strbuf = std.array_list.Managed(u8).init(allocator);
         defer strbuf.deinit();
         try writeSignature(&strbuf, &func_export);
         std.log.err("Specified {} params but expected {}. The signature of '{s}' is:\n{s}", .{
@@ -303,7 +315,7 @@ pub fn main() !void {
 
     std.debug.assert(invoke_args.len == num_params);
 
-    var params = std.ArrayList(bytebox.Val).init(allocator);
+    var params = std.array_list.Managed(bytebox.Val).init(allocator);
     defer params.deinit();
     try params.resize(invoke_args.len);
     for (func_export.params, 0..) |valtype, i| {
@@ -352,7 +364,7 @@ pub fn main() !void {
         }
     }
 
-    var returns = std.ArrayList(bytebox.Val).init(allocator);
+    var returns = std.array_list.Managed(bytebox.Val).init(allocator);
     try returns.resize(func_export.returns.len);
 
     module_instance.invoke(func_handle, params.items.ptr, returns.items.ptr, .{}) catch |e| {
@@ -363,7 +375,7 @@ pub fn main() !void {
     };
 
     {
-        var strbuf = std.ArrayList(u8).init(allocator);
+        var strbuf = std.array_list.Managed(u8).init(allocator);
         defer strbuf.deinit();
         const writer = strbuf.writer();
 
@@ -389,7 +401,7 @@ pub fn main() !void {
     }
 }
 
-fn writeSignature(strbuf: *std.ArrayList(u8), info: *const bytebox.FunctionExport) !void {
+fn writeSignature(strbuf: *std.array_list.Managed(u8), info: *const bytebox.FunctionExport) !void {
     const writer = strbuf.writer();
     if (info.params.len == 0) {
         try std.fmt.format(writer, "  params: none\n", .{});

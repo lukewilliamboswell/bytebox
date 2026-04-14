@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const AllocError = std.mem.Allocator.Error;
 
 const config = @import("config");
 
@@ -26,6 +27,8 @@ pub const v128 = def.v128;
 const BlockImmediates = def.BlockImmediates;
 const BranchTableImmediates = def.BranchTableImmediates;
 const CallIndirectImmediates = def.CallIndirectImmediates;
+const IfImmediates = def.IfImmediates;
+const ValidationImmediates = def.ValidationImmediates;
 const ConstantExpression = def.ConstantExpression;
 const DataDefinition = def.DataDefinition;
 const ElementDefinition = def.ElementDefinition;
@@ -37,7 +40,6 @@ const FunctionHandleType = def.FunctionHandleType;
 const FunctionTypeDefinition = def.FunctionTypeDefinition;
 const GlobalDefinition = def.GlobalDefinition;
 const GlobalMut = def.GlobalMut;
-const IfImmediates = def.IfImmediates;
 const ImportNames = def.ImportNames;
 const Instruction = def.Instruction;
 const Limits = def.Limits;
@@ -53,6 +55,7 @@ const FuncRef = def.FuncRef;
 const inst = @import("instance.zig");
 const UnlinkableError = inst.UnlinkableError;
 const UninstantiableError = inst.UninstantiableError;
+const InstantiateError = inst.InstantiateError;
 const ExportError = inst.ExportError;
 const TrapError = inst.TrapError;
 const HostFunctionError = inst.HostFunctionError;
@@ -82,6 +85,7 @@ const FuncCallData = Stack.FuncCallData;
 const FunctionInstance = Stack.FunctionInstance;
 
 const OpHelpers = @import("stack_ops.zig");
+const HostFunctionData = OpHelpers.HostFunctionData;
 
 fn preamble(name: []const u8, pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
     if (metering.enabled) {
@@ -118,7 +122,7 @@ fn preamble(name: []const u8, pc: u32, code: [*]const Instruction, stack: *Stack
 }
 
 // pc is the "program counter", which points to the next instruction to execute
-const InstructionFunc = *const fn (pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void;
+const InstructionFunc = *const fn (pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void;
 
 // Maps all instructions to an execution function, to map opcodes directly to function pointers
 // which avoids a giant switch statement. Because the switch-style has a single conditional
@@ -149,13 +153,20 @@ const InstructionFuncs = struct {
         &op_Call_Import,
         &op_Call_Indirect,
         &op_Drop,
+        &op_Drop_V128,
         &op_Select,
-        &op_Select_T,
+        &op_Invalid, // Opcode.SelectT should have been replaced with either .Select or .SelectV128
+        &op_Select_V128,
         &op_Local_Get,
         &op_Local_Set,
         &op_Local_Tee,
+        &op_Local_Get_V128,
+        &op_Local_Set_V128,
+        &op_Local_Tee_V128,
         &op_Global_Get,
         &op_Global_Set,
+        &op_Global_Get_V128,
+        &op_Global_Set_V128,
         &op_Table_Get,
         &op_Table_Set,
         &op_I32_Load,
@@ -574,7 +585,7 @@ const InstructionFuncs = struct {
         &op_F64x2_Convert_Low_I32x4_U,
     };
 
-    fn run(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn run(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try @call(.always_tail, InstructionFuncs.lookup(code[pc].opcode), .{ pc, code, stack });
     }
 
@@ -582,2658 +593,2692 @@ const InstructionFuncs = struct {
         return opcodeToFuncTable[@intFromEnum(opcode)];
     }
 
-    fn op_Invalid(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Invalid(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Invalid", pc, code, stack);
         unreachable;
     }
 
-    fn op_Unreachable(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Unreachable(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Unreachable", pc, code, stack);
         return error.TrapUnreachable;
     }
 
-    fn op_DebugTrap(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_DebugTrap(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("DebugTrap", pc, code, stack);
         return OpHelpers.debugTrap(pc, stack);
     }
 
-    fn op_Noop(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Noop(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Noop", pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Block(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Block(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Block", pc, code, stack);
-        try OpHelpers.block(pc, code, stack);
+        OpHelpers.block(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Loop(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Loop(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Loop", pc, code, stack);
-        try OpHelpers.loop(pc, code, stack);
+        OpHelpers.loop(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_If(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_If(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("If", pc, code, stack);
 
         const next_pc = OpHelpers.@"if"(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[next_pc].opcode), .{ next_pc, code, stack });
     }
 
-    fn op_IfNoElse(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_IfNoElse(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("IfNoElse", pc, code, stack);
         const next_pc = OpHelpers.ifNoElse(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[next_pc].opcode), .{ next_pc, code, stack });
     }
 
-    fn op_Else(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Else(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Else", pc, code, stack);
-        // getting here means we reached the end of the if opcode chain, so skip to the true end opcode
         const next_pc = OpHelpers.@"else"(pc, code);
         try @call(.always_tail, InstructionFuncs.lookup(code[next_pc].opcode), .{ next_pc, code, stack });
     }
 
-    fn op_End(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_End(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("End", pc, code, stack);
-
         const next = OpHelpers.end(pc, code, stack) orelse return;
         try @call(.always_tail, InstructionFuncs.lookup(next.code[next.continuation].opcode), .{ next.continuation, next.code, stack });
     }
 
-    fn op_Branch(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Branch(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Branch", pc, code, stack);
         const next: FuncCallData = OpHelpers.branch(pc, code, stack) orelse return;
         try @call(.always_tail, InstructionFuncs.lookup(next.code[next.continuation].opcode), .{ next.continuation, next.code, stack });
     }
 
-    fn op_Branch_If(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Branch_If(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Branch_If", pc, code, stack);
         const next = OpHelpers.branchIf(pc, code, stack) orelse return;
         try @call(.always_tail, InstructionFuncs.lookup(next.code[next.continuation].opcode), .{ next.continuation, next.code, stack });
     }
 
-    fn op_Branch_Table(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Branch_Table(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Branch_Table", pc, code, stack);
         const next = OpHelpers.branchTable(pc, code, stack) orelse return;
         try @call(.always_tail, InstructionFuncs.lookup(next.code[next.continuation].opcode), .{ next.continuation, next.code, stack });
     }
 
-    fn op_Return(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Return(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Return", pc, code, stack);
         const next: FuncCallData = OpHelpers.@"return"(stack) orelse return;
         try @call(.always_tail, InstructionFuncs.lookup(next.code[next.continuation].opcode), .{ next.continuation, next.code, stack });
     }
 
-    fn op_Call_Local(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Call_Local(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Call", pc, code, stack);
-
         const next = try OpHelpers.callLocal(pc, code, stack);
-
         try @call(.always_tail, InstructionFuncs.lookup(next.code[next.continuation].opcode), .{ next.continuation, next.code, stack });
     }
 
-    fn op_Call_Import(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Call_Import(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Call", pc, code, stack);
-
         const next = try OpHelpers.callImport(pc, code, stack);
-
         try @call(.always_tail, InstructionFuncs.lookup(next.code[next.continuation].opcode), .{ next.continuation, next.code, stack });
     }
 
-    fn op_Call_Indirect(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Call_Indirect(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Call_Indirect", pc, code, stack);
-
         const next = try OpHelpers.callIndirect(pc, code, stack);
-
         try @call(.always_tail, InstructionFuncs.lookup(next.code[next.continuation].opcode), .{ next.continuation, next.code, stack });
     }
 
-    fn op_Drop(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Drop(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Drop", pc, code, stack);
         OpHelpers.drop(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Select(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Drop_V128(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
+        try preamble("Drop_V128", pc, code, stack);
+        OpHelpers.dropV128(stack);
+        try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
+    }
+
+    fn op_Select(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Select", pc, code, stack);
-
         OpHelpers.select(stack);
-
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Select_T(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
-        try preamble("Select_T", pc, code, stack);
-
-        OpHelpers.selectT(stack);
-
+    fn op_Select_V128(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
+        try preamble("Select_V128", pc, code, stack);
+        OpHelpers.selectV128(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Local_Get(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Local_Get(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Local_Get", pc, code, stack);
         OpHelpers.localGet(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Local_Set(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Local_Set(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Local_Set", pc, code, stack);
-
         OpHelpers.localSet(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Local_Tee(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Local_Tee(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Local_Tee", pc, code, stack);
         OpHelpers.localTee(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Global_Get(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Local_Get_V128(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
+        try preamble("Local_Get_V128", pc, code, stack);
+        OpHelpers.localGetV128(pc, code, stack);
+        try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
+    }
+
+    fn op_Local_Set_V128(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
+        try preamble("Local_Set_V128", pc, code, stack);
+        OpHelpers.localSetV128(pc, code, stack);
+        try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
+    }
+
+    fn op_Local_Tee_V128(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
+        try preamble("Local_Tee_V128", pc, code, stack);
+        OpHelpers.localTeeV128(pc, code, stack);
+        try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
+    }
+
+    fn op_Global_Get(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Global_Get", pc, code, stack);
         OpHelpers.globalGet(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Global_Set(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Global_Set(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Global_Set", pc, code, stack);
         OpHelpers.globalSet(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Table_Get(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Global_Get_V128(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
+        try preamble("Global_Get_V128", pc, code, stack);
+        OpHelpers.globalGetV128(pc, code, stack);
+        try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
+    }
+
+    fn op_Global_Set_V128(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
+        try preamble("Global_Set_V128", pc, code, stack);
+        OpHelpers.globalSetV128(pc, code, stack);
+        try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
+    }
+
+    fn op_Table_Get(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Table_Get", pc, code, stack);
         try OpHelpers.tableGet(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Table_Set(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Table_Set(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Table_Set", pc, code, stack);
         try OpHelpers.tableSet(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Load(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Load(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Load", pc, code, stack);
         try OpHelpers.i32Load(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Load(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Load(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Load", pc, code, stack);
         try OpHelpers.i64Load(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Load(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Load(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Load", pc, code, stack);
         try OpHelpers.f32Load(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Load(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Load(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Load", pc, code, stack);
         try OpHelpers.f64Load(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Load8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Load8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Load8_S", pc, code, stack);
         try OpHelpers.i32Load8S(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Load8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Load8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Load8_U", pc, code, stack);
         try OpHelpers.i32Load8U(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Load16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Load16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Load16_S", pc, code, stack);
         try OpHelpers.i32Load16S(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Load16_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Load16_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Load16_U", pc, code, stack);
         try OpHelpers.i32Load16U(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Load8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Load8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Load8_S", pc, code, stack);
         try OpHelpers.i64Load8S(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Load8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Load8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Load8_U", pc, code, stack);
         try OpHelpers.i64Load8U(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Load16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Load16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Load16_S", pc, code, stack);
         try OpHelpers.i64Load16S(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Load16_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Load16_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Load16_U", pc, code, stack);
         try OpHelpers.i64Load16U(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Load32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Load32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Load32_S", pc, code, stack);
         try OpHelpers.i64Load32S(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Load32_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Load32_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Load32_U", pc, code, stack);
         try OpHelpers.i64Load32U(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Store(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Store(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Store", pc, code, stack);
         try OpHelpers.i32Store(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Store(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Store(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Store", pc, code, stack);
         try OpHelpers.i64Store(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Store(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Store(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Store", pc, code, stack);
         try OpHelpers.f32Store(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Store(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Store(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Store", pc, code, stack);
         try OpHelpers.f64Store(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Store8(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Store8(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Store8", pc, code, stack);
         try OpHelpers.i32Store8(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Store16(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Store16(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Store16", pc, code, stack);
         try OpHelpers.i32Store16(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Store8(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Store8(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Store8", pc, code, stack);
         try OpHelpers.i64Store8(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Store16(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Store16(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Store16", pc, code, stack);
         try OpHelpers.i64Store16(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Store32(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Store32(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Store32", pc, code, stack);
         try OpHelpers.i64Store32(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Memory_Size(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Memory_Size(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Memory_Size", pc, code, stack);
         OpHelpers.memorySize(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Memory_Grow(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Memory_Grow(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Memory_Grow", pc, code, stack);
         OpHelpers.memoryGrow(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Const(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Const(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Const", pc, code, stack);
         OpHelpers.i32Const(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Const(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Const(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Const", pc, code, stack);
         OpHelpers.i64Const(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Const(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Const(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Const", pc, code, stack);
         OpHelpers.f32Const(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Const(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Const(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Const", pc, code, stack);
         OpHelpers.f64Const(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Eqz(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Eqz(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Eqz", pc, code, stack);
         OpHelpers.i32Eqz(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Eq(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Eq(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Eq", pc, code, stack);
         OpHelpers.i32Eq(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_NE", pc, code, stack);
         OpHelpers.i32NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_LT_S", pc, code, stack);
         OpHelpers.i32LTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_LT_U", pc, code, stack);
         OpHelpers.i32LTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_GT_S", pc, code, stack);
         OpHelpers.i32GTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_GT_U", pc, code, stack);
         OpHelpers.i32GTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_LE_S", pc, code, stack);
         OpHelpers.i32LES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_LE_U", pc, code, stack);
         OpHelpers.i32LEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_GE_S", pc, code, stack);
         OpHelpers.i32GES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_GE_U", pc, code, stack);
         OpHelpers.i32GEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Eqz(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Eqz(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Eqz", pc, code, stack);
         OpHelpers.i64Eqz(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Eq(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Eq(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Eq", pc, code, stack);
         OpHelpers.i64Eq(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_NE", pc, code, stack);
         OpHelpers.i64NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_LT_S", pc, code, stack);
         OpHelpers.i64LTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_LT_U", pc, code, stack);
         OpHelpers.i64LTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_GT_S", pc, code, stack);
         OpHelpers.i64GTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_GT_U", pc, code, stack);
         OpHelpers.i64GTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_LE_S", pc, code, stack);
         OpHelpers.i64LES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_LE_U", pc, code, stack);
         OpHelpers.i64LEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_GE_S", pc, code, stack);
         OpHelpers.i64GES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_GE_U", pc, code, stack);
         OpHelpers.i64GEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_EQ", pc, code, stack);
         OpHelpers.f32EQ(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_NE", pc, code, stack);
         OpHelpers.f32NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_LT(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_LT(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_LT", pc, code, stack);
         OpHelpers.f32LT(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_GT(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_GT(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_GT", pc, code, stack);
         OpHelpers.f32GT(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_LE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_LE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_LE", pc, code, stack);
         OpHelpers.f32LE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_GE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_GE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_GE", pc, code, stack);
         OpHelpers.f32GE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_EQ", pc, code, stack);
         OpHelpers.f64EQ(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_NE", pc, code, stack);
         OpHelpers.f64NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_LT(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_LT(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_LT", pc, code, stack);
         OpHelpers.f64LT(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_GT(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_GT(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_GT", pc, code, stack);
         OpHelpers.f64GT(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_LE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_LE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_LE", pc, code, stack);
         OpHelpers.f64LE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_GE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_GE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_GE", pc, code, stack);
         OpHelpers.f64GE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Clz(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Clz(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Clz", pc, code, stack);
         OpHelpers.i32Clz(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Ctz(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Ctz(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Ctz", pc, code, stack);
         OpHelpers.i32Ctz(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Popcnt(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Popcnt(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Popcnt", pc, code, stack);
         OpHelpers.i32Popcnt(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Add", pc, code, stack);
         OpHelpers.i32Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Sub", pc, code, stack);
         OpHelpers.i32Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Mul", pc, code, stack);
         OpHelpers.i32Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Div_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Div_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Div_S", pc, code, stack);
         try OpHelpers.i32DivS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Div_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Div_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Div_U", pc, code, stack);
         try OpHelpers.i32DivU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Rem_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Rem_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Rem_S", pc, code, stack);
         try OpHelpers.i32RemS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Rem_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Rem_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Rem_U", pc, code, stack);
         try OpHelpers.i32RemU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_And(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_And(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_And", pc, code, stack);
         OpHelpers.i32And(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Or(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Or(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Or", pc, code, stack);
         OpHelpers.i32Or(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Xor(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Xor(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Xor", pc, code, stack);
         OpHelpers.i32Xor(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Shl", pc, code, stack);
         try OpHelpers.i32Shl(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Shr_S", pc, code, stack);
         try OpHelpers.i32ShrS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Shr_U", pc, code, stack);
         try OpHelpers.i32ShrU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Rotl(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Rotl(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Rotl", pc, code, stack);
         OpHelpers.i32Rotl(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Rotr(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Rotr(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Rotr", pc, code, stack);
         OpHelpers.i32Rotr(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Clz(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Clz(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Clz", pc, code, stack);
         OpHelpers.i64Clz(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Ctz(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Ctz(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Ctz", pc, code, stack);
         OpHelpers.i64Ctz(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Popcnt(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Popcnt(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Popcnt", pc, code, stack);
         OpHelpers.i64Popcnt(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Add", pc, code, stack);
         OpHelpers.i64Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Sub", pc, code, stack);
         OpHelpers.i64Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Mul", pc, code, stack);
         OpHelpers.i64Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Div_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Div_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Div_S", pc, code, stack);
         try OpHelpers.i64DivS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Div_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Div_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Div_U", pc, code, stack);
         try OpHelpers.i64DivU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Rem_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Rem_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Rem_S", pc, code, stack);
         try OpHelpers.i64RemS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Rem_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Rem_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Rem_U", pc, code, stack);
         try OpHelpers.i64RemU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_And(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_And(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_And", pc, code, stack);
         OpHelpers.i64And(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Or(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Or(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Or", pc, code, stack);
         OpHelpers.i64Or(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Xor(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Xor(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Xor", pc, code, stack);
         OpHelpers.i64Xor(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Shl", pc, code, stack);
         try OpHelpers.i64Shl(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Shr_S", pc, code, stack);
         try OpHelpers.i64ShrS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Shr_U", pc, code, stack);
         try OpHelpers.i64ShrU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Rotl(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Rotl(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Rotl", pc, code, stack);
         OpHelpers.i64Rotl(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Rotr(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Rotr(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Rotr", pc, code, stack);
         OpHelpers.i64Rotr(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Abs", pc, code, stack);
         OpHelpers.f32Abs(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Neg", pc, code, stack);
         OpHelpers.f32Neg(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Ceil(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Ceil(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Ceil", pc, code, stack);
         OpHelpers.f32Ceil(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Floor(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Floor(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Floor", pc, code, stack);
         OpHelpers.f32Floor(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Trunc(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Trunc(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Trunc", pc, code, stack);
         OpHelpers.f32Trunc(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Nearest(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Nearest(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Nearest", pc, code, stack);
         OpHelpers.f32Nearest(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Sqrt(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Sqrt(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Sqrt", pc, code, stack);
         OpHelpers.f32Sqrt(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Add", pc, code, stack);
         OpHelpers.f32Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Sub", pc, code, stack);
         OpHelpers.f32Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Mul", pc, code, stack);
         OpHelpers.f32Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Div(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Div(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Div", pc, code, stack);
         OpHelpers.f32Div(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Min(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Min(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Min", pc, code, stack);
         OpHelpers.f32Min(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Max(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Max(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Max", pc, code, stack);
         OpHelpers.f32Max(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Copysign(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Copysign(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Copysign", pc, code, stack);
         OpHelpers.f32Copysign(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Abs", pc, code, stack);
         OpHelpers.f64Abs(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Neg", pc, code, stack);
         OpHelpers.f64Neg(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Ceil(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Ceil(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Ceil", pc, code, stack);
         OpHelpers.f64Ceil(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Floor(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Floor(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Floor", pc, code, stack);
         OpHelpers.f64Floor(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Trunc(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Trunc(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Trunc", pc, code, stack);
         OpHelpers.f64Trunc(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Nearest(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Nearest(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Nearest", pc, code, stack);
         OpHelpers.f64Nearest(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Sqrt(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Sqrt(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Sqrt", pc, code, stack);
         OpHelpers.f64Sqrt(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Add", pc, code, stack);
         OpHelpers.f64Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Sub", pc, code, stack);
         OpHelpers.f64Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Mul", pc, code, stack);
         OpHelpers.f64Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Div(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Div(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Div", pc, code, stack);
         OpHelpers.f64Div(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Min(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Min(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Min", pc, code, stack);
         OpHelpers.f64Min(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Max(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Max(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Max", pc, code, stack);
         OpHelpers.f64Max(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Copysign(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Copysign(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Copysign", pc, code, stack);
         OpHelpers.f64Copysign(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Wrap_I64(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Wrap_I64(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Wrap_I64", pc, code, stack);
         OpHelpers.i32WrapI64(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Trunc_F32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Trunc_F32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Trunc_F32_S", pc, code, stack);
         try OpHelpers.i32TruncF32S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Trunc_F32_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Trunc_F32_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Trunc_F32_U", pc, code, stack);
         try OpHelpers.i32TruncF32U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Trunc_F64_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Trunc_F64_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Trunc_F64_S", pc, code, stack);
         try OpHelpers.i32TruncF64S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Trunc_F64_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Trunc_F64_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Trunc_F64_U", pc, code, stack);
         try OpHelpers.i32TruncF64U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Extend_I32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Extend_I32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Extend_I32_S", pc, code, stack);
         OpHelpers.i64ExtendI32S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Extend_I32_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Extend_I32_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Extend_I32_U", pc, code, stack);
         OpHelpers.i64ExtendI32U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Trunc_F32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Trunc_F32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Trunc_F32_S", pc, code, stack);
         try OpHelpers.i64TruncF32S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Trunc_F32_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Trunc_F32_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Trunc_F32_U", pc, code, stack);
         try OpHelpers.i64TruncF32U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Trunc_F64_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Trunc_F64_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Trunc_F64_S", pc, code, stack);
         try OpHelpers.i64TruncF64S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Trunc_F64_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Trunc_F64_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Trunc_F64_U", pc, code, stack);
         try OpHelpers.i64TruncF64U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Convert_I32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Convert_I32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Convert_I32_S", pc, code, stack);
         OpHelpers.f32ConvertI32S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Convert_I32_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Convert_I32_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Convert_I32_U", pc, code, stack);
         OpHelpers.f32ConvertI32U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Convert_I64_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Convert_I64_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Convert_I64_S", pc, code, stack);
         OpHelpers.f32ConvertI64S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Convert_I64_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Convert_I64_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Convert_I64_U", pc, code, stack);
         OpHelpers.f32ConvertI64U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Demote_F64(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Demote_F64(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Demote_F64", pc, code, stack);
         OpHelpers.f32DemoteF64(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Convert_I32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Convert_I32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Convert_I32_S", pc, code, stack);
         OpHelpers.f64ConvertI32S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Convert_I32_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Convert_I32_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Convert_I32_U", pc, code, stack);
         OpHelpers.f64ConvertI32U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Convert_I64_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Convert_I64_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Convert_I64_S", pc, code, stack);
         OpHelpers.f64ConvertI64S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Convert_I64_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Convert_I64_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Convert_I64_U", pc, code, stack);
         OpHelpers.f64ConvertI64U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Promote_F32(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Promote_F32(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Promote_F32", pc, code, stack);
         OpHelpers.f64PromoteF32(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Reinterpret_F32(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Reinterpret_F32(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Reinterpret_F32", pc, code, stack);
         OpHelpers.i32ReinterpretF32(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Reinterpret_F64(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Reinterpret_F64(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Reinterpret_F64", pc, code, stack);
         OpHelpers.i64ReinterpretF64(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32_Reinterpret_I32(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32_Reinterpret_I32(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32_Reinterpret_I32", pc, code, stack);
         OpHelpers.f32ReinterpretI32(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64_Reinterpret_I64(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64_Reinterpret_I64(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64_Reinterpret_I64", pc, code, stack);
         OpHelpers.f64ReinterpretI64(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Extend8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Extend8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Extend8_S", pc, code, stack);
         OpHelpers.i32Extend8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Extend16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Extend16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Extend16_S", pc, code, stack);
         OpHelpers.i32Extend16S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Extend8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Extend8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Extend8_S", pc, code, stack);
         OpHelpers.i64Extend8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Extend16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Extend16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Extend16_S", pc, code, stack);
         OpHelpers.i64Extend16S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Extend32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Extend32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Extend32_S", pc, code, stack);
         OpHelpers.i64Extend32S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Ref_Null(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Ref_Null(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Ref_Null", pc, code, stack);
-        try OpHelpers.refNull(pc, code, stack);
+        try OpHelpers.refNull(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Ref_Is_Null(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Ref_Is_Null(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Ref_Is_Null", pc, code, stack);
         OpHelpers.refIsNull(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Ref_Func(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Ref_Func(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Ref_Func", pc, code, stack);
         OpHelpers.refFunc(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Trunc_Sat_F32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Trunc_Sat_F32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Trunc_Sat_F32_S", pc, code, stack);
         OpHelpers.i32TruncSatF32S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Trunc_Sat_F32_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Trunc_Sat_F32_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Trunc_Sat_F32_U", pc, code, stack);
         OpHelpers.i32TruncSatF32U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Trunc_Sat_F64_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Trunc_Sat_F64_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Trunc_Sat_F64_S", pc, code, stack);
         OpHelpers.i32TruncSatF64S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32_Trunc_Sat_F64_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32_Trunc_Sat_F64_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32_Trunc_Sat_F64_U", pc, code, stack);
         OpHelpers.i32TruncSatF64U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Trunc_Sat_F32_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Trunc_Sat_F32_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Trunc_Sat_F32_S", pc, code, stack);
         OpHelpers.i64TruncSatF32S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Trunc_Sat_F32_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Trunc_Sat_F32_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Trunc_Sat_F32_U", pc, code, stack);
         OpHelpers.i64TruncSatF32U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Trunc_Sat_F64_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Trunc_Sat_F64_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Trunc_Sat_F64_S", pc, code, stack);
         OpHelpers.i64TruncSatF64S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64_Trunc_Sat_F64_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64_Trunc_Sat_F64_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64_Trunc_Sat_F64_U", pc, code, stack);
         OpHelpers.i64TruncSatF64U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Memory_Init(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Memory_Init(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Memory_Init", pc, code, stack);
         try OpHelpers.memoryInit(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Data_Drop(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Data_Drop(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Data_Drop", pc, code, stack);
         OpHelpers.dataDrop(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Memory_Copy(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Memory_Copy(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Memory_Copy", pc, code, stack);
         try OpHelpers.memoryCopy(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Memory_Fill(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Memory_Fill(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Memory_Fill", pc, code, stack);
         try OpHelpers.memoryFill(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Table_Init(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Table_Init(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Table_Init", pc, code, stack);
         try OpHelpers.tableInit(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Elem_Drop(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Elem_Drop(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Elem_Drop", pc, code, stack);
         OpHelpers.elemDrop(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Table_Copy(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Table_Copy(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Table_Copy", pc, code, stack);
         try OpHelpers.tableCopy(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Table_Grow(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Table_Grow(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Table_Grow", pc, code, stack);
         OpHelpers.tableGrow(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Table_Size(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Table_Size(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Table_Size", pc, code, stack);
         OpHelpers.tableSize(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_Table_Fill(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_Table_Fill(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("Table_Fill", pc, code, stack);
         try OpHelpers.tableFill(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load", pc, code, stack);
         try OpHelpers.v128Load(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load8x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load8x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load8x8_S", pc, code, stack);
         try OpHelpers.v128Load8x8S(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load8x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load8x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load8x8_S", pc, code, stack);
         try OpHelpers.v128Load8x8U(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load16x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load16x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load16x4_S", pc, code, stack);
         try OpHelpers.v128Load16x4S(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load16x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load16x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load16x4_U", pc, code, stack);
         try OpHelpers.v128Load16x4U(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load32x2_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load32x2_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load32x2_S", pc, code, stack);
         try OpHelpers.v128Load32x2S(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load32x2_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load32x2_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load32x2_U", pc, code, stack);
         try OpHelpers.v128Load32x2U(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load8_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load8_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load8_Splat", pc, code, stack);
         try OpHelpers.v128Load8Splat(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load16_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load16_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load16_Splat", pc, code, stack);
         try OpHelpers.v128Load16Splat(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load32_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load32_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load32_Splat", pc, code, stack);
         try OpHelpers.v128Load32Splat(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load64_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load64_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load64_Splat", pc, code, stack);
         try OpHelpers.v128Load64Splat(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Splat", pc, code, stack);
         OpHelpers.i8x16Splat(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Splat", pc, code, stack);
         OpHelpers.i16x8Splat(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Splat", pc, code, stack);
         OpHelpers.i32x4Splat(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Splat", pc, code, stack);
         OpHelpers.i64x2Splat(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Splat", pc, code, stack);
         OpHelpers.f32x4Splat(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Splat(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Splat", pc, code, stack);
         OpHelpers.f64x2Splat(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Extract_Lane_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Extract_Lane_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Extract_Lane_S", pc, code, stack);
         OpHelpers.i8x16ExtractLaneS(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Extract_Lane_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Extract_Lane_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Extract_Lane_U", pc, code, stack);
         OpHelpers.i8x16ExtractLaneU(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Replace_Lane", pc, code, stack);
         OpHelpers.i8x16ReplaceLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extract_Lane_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extract_Lane_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extract_Lane_S", pc, code, stack);
         OpHelpers.i16x8ExtractLaneS(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extract_Lane_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extract_Lane_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extract_Lane_U", pc, code, stack);
         OpHelpers.i16x8ExtractLaneU(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Replace_Lane", pc, code, stack);
         OpHelpers.i16x8ReplaceLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extract_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extract_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extract_Lane", pc, code, stack);
         OpHelpers.i32x4ExtractLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Replace_Lane", pc, code, stack);
         OpHelpers.i32x4ReplaceLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Extract_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extract_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Extract_Lane", pc, code, stack);
         OpHelpers.i64x2ExtractLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Replace_Lane", pc, code, stack);
         OpHelpers.i64x2ReplaceLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Extract_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Extract_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Extract_Lane", pc, code, stack);
         OpHelpers.f32x4ExtractLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Replace_Lane", pc, code, stack);
         OpHelpers.f32x4ReplaceLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Extract_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Extract_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Extract_Lane", pc, code, stack);
         OpHelpers.f64x2ExtractLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Replace_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Replace_Lane", pc, code, stack);
         OpHelpers.f64x2ReplaceLane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_EQ", pc, code, stack);
         OpHelpers.i8x16EQ(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_NE", pc, code, stack);
         OpHelpers.i8x16NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_LT_S", pc, code, stack);
         OpHelpers.i8x16LTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_LT_U", pc, code, stack);
         OpHelpers.i8x16LTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_GT_S", pc, code, stack);
         OpHelpers.i8x16GTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_GT_U", pc, code, stack);
         OpHelpers.i8x16GTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_LE_S", pc, code, stack);
         OpHelpers.i8x16LES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_LE_U", pc, code, stack);
         OpHelpers.i8x16LEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_GE_S", pc, code, stack);
         OpHelpers.i8x16GES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_GE_U", pc, code, stack);
         OpHelpers.i8x16GEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_EQ", pc, code, stack);
         OpHelpers.i16x8EQ(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_NE", pc, code, stack);
         OpHelpers.i16x8NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_LT_S", pc, code, stack);
         OpHelpers.i16x8LTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_LT_U", pc, code, stack);
         OpHelpers.i16x8LTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_GT_S", pc, code, stack);
         OpHelpers.i16x8GTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_GT_U", pc, code, stack);
         OpHelpers.i16x8GTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_LE_S", pc, code, stack);
         OpHelpers.i16x8LES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_LE_U", pc, code, stack);
         OpHelpers.i16x8LEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_GE_S", pc, code, stack);
         OpHelpers.i16x8GES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_GE_U", pc, code, stack);
         OpHelpers.i16x8GEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_EQ", pc, code, stack);
         OpHelpers.i32x4EQ(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_NE", pc, code, stack);
         OpHelpers.i32x4NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_LT_S", pc, code, stack);
         OpHelpers.i32x4LTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_LT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_LT_U", pc, code, stack);
         OpHelpers.i32x4LTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_GT_S", pc, code, stack);
         OpHelpers.i32x4GTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_GT_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_GT_U", pc, code, stack);
         OpHelpers.i32x4GTU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_LE_S", pc, code, stack);
         OpHelpers.i32x4LES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_LE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_LE_U", pc, code, stack);
         OpHelpers.i32x4LEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_GE_S", pc, code, stack);
         OpHelpers.i32x4GES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_GE_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_GE_U", pc, code, stack);
         OpHelpers.i32x4GEU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_EQ", pc, code, stack);
         OpHelpers.f32x4EQ(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_NE", pc, code, stack);
         OpHelpers.f32x4NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_LT(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_LT(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_LT", pc, code, stack);
         OpHelpers.f32x4LT(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_GT(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_GT(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_GT", pc, code, stack);
         OpHelpers.f32x4GT(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_LE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_LE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_LE", pc, code, stack);
         OpHelpers.f32x4LE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_GE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_GE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_GE", pc, code, stack);
         OpHelpers.f32x4GE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_EQ", pc, code, stack);
         OpHelpers.f64x2EQ(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_NE", pc, code, stack);
         OpHelpers.f64x2NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_LT(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_LT(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_LT", pc, code, stack);
         OpHelpers.f64x2LT(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_GT(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_GT(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_GT", pc, code, stack);
         OpHelpers.f64x2GT(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_LE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_LE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_LE", pc, code, stack);
         OpHelpers.f64x2LE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_GE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_GE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_GE", pc, code, stack);
         OpHelpers.f64x2GE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Store(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Store(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Store", pc, code, stack);
         try OpHelpers.v128Store(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Const(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Const(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Const", pc, code, stack);
         OpHelpers.v128Const(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Shuffle(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Shuffle(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Shuffle", pc, code, stack);
         OpHelpers.i8x16Shuffle(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Swizzle(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Swizzle(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Swizzle", pc, code, stack);
         OpHelpers.i8x16Swizzle(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Not(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Not(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Not", pc, code, stack);
         OpHelpers.v128Not(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_And(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_And(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_And", pc, code, stack);
         OpHelpers.v128And(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_AndNot(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_AndNot(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_AndNot", pc, code, stack);
         OpHelpers.v128AndNot(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Or(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Or(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Or", pc, code, stack);
         OpHelpers.v128Or(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Xor(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Xor(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Xor", pc, code, stack);
         OpHelpers.v128Xor(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Bitselect(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Bitselect(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Bitselect", pc, code, stack);
         OpHelpers.v128Bitselect(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_AnyTrue(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_AnyTrue(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_AnyTrue", pc, code, stack);
         OpHelpers.v128AnyTrue(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load8_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load8_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load8_Lane", pc, code, stack);
         try OpHelpers.v128Load8Lane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load16_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load16_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load16_Lane", pc, code, stack);
         try OpHelpers.v128Load16Lane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load32_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load32_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load32_Lane", pc, code, stack);
         try OpHelpers.v128Load32Lane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load64_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load64_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load64_Lane", pc, code, stack);
         try OpHelpers.v128Load64Lane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Store8_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Store8_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Store8_Lane", pc, code, stack);
         try OpHelpers.v128Store8Lane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Store16_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Store16_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Store16_Lane", pc, code, stack);
         try OpHelpers.v128Store16Lane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Store32_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Store32_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Store32_Lane", pc, code, stack);
         try OpHelpers.v128Store32Lane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Store64_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Store64_Lane(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Store64_Lane", pc, code, stack);
         try OpHelpers.v128Store64Lane(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load32_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load32_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load32_Zero", pc, code, stack);
         try OpHelpers.v128Load32Zero(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_V128_Load64_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_V128_Load64_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("V128_Load64_Zero", pc, code, stack);
         try OpHelpers.v128Load64Zero(pc, code, stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Demote_F64x2_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Demote_F64x2_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Demote_F64x2_Zero", pc, code, stack);
         OpHelpers.f32x4DemoteF64x2Zero(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Promote_Low_F32x4(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Promote_Low_F32x4(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Promote_Low_F32x4", pc, code, stack);
         OpHelpers.f64x2PromoteLowF32x4(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Abs", pc, code, stack);
         OpHelpers.i8x16Abs(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Neg", pc, code, stack);
         OpHelpers.i8x16Neg(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Popcnt(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Popcnt(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Popcnt", pc, code, stack);
         OpHelpers.i8x16Popcnt(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_AllTrue(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_AllTrue(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_AllTrue", pc, code, stack);
         OpHelpers.i8x16AllTrue(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Bitmask(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Bitmask(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Bitmask", pc, code, stack);
         OpHelpers.i8x16Bitmask(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Narrow_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Narrow_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Narrow_I16x8_S", pc, code, stack);
         OpHelpers.i8x16NarrowI16x8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Narrow_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Narrow_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Narrow_I16x8_U", pc, code, stack);
         OpHelpers.i8x16NarrowI16x8U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Ceil(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Ceil(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Ceil", pc, code, stack);
         OpHelpers.f32x4Ceil(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Floor(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Floor(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Floor", pc, code, stack);
         OpHelpers.f32x4Floor(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Trunc(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Trunc(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Trunc", pc, code, stack);
         OpHelpers.f32x4Trunc(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Nearest(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Nearest(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Nearest", pc, code, stack);
         OpHelpers.f32x4Nearest(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Shl", pc, code, stack);
         OpHelpers.i8x16Shl(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Shr_S", pc, code, stack);
         OpHelpers.i8x16ShrS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Shr_U", pc, code, stack);
         OpHelpers.i8x16ShrU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Add", pc, code, stack);
         OpHelpers.i8x16Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Add_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Add_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Add_Sat_S", pc, code, stack);
         OpHelpers.i8x16AddSatS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Add_Sat_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Add_Sat_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Add_Sat_U", pc, code, stack);
         OpHelpers.i8x16AddSatU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Sub", pc, code, stack);
         OpHelpers.i8x16Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Sub_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Sub_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Sub_Sat_S", pc, code, stack);
         OpHelpers.i8x16SubSatS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Sub_Sat_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Sub_Sat_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Sub_Sat_U", pc, code, stack);
         OpHelpers.i8x16SubSatU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Ceil(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Ceil(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Ceil", pc, code, stack);
         OpHelpers.f64x2Ceil(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Floor(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Floor(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Floor", pc, code, stack);
         OpHelpers.f64x2Floor(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Min_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Min_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Min_S", pc, code, stack);
         OpHelpers.i8x16MinS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Min_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Min_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Min_U", pc, code, stack);
         OpHelpers.i8x16MinU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Max_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Max_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Max_S", pc, code, stack);
         OpHelpers.i8x16MaxS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Max_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Max_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Max_U", pc, code, stack);
         OpHelpers.i8x16MaxU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Trunc(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Trunc(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Trunc", pc, code, stack);
         OpHelpers.f64x2Trunc(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I8x16_Avgr_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I8x16_Avgr_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I8x16_Avgr_U", pc, code, stack);
         OpHelpers.i8x16AvgrU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extadd_Pairwise_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extadd_Pairwise_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extadd_Pairwise_I8x16_S", pc, code, stack);
         OpHelpers.i16x8ExtaddPairwiseI8x16S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extadd_Pairwise_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extadd_Pairwise_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extadd_Pairwise_I8x16_U", pc, code, stack);
         OpHelpers.i16x8ExtaddPairwiseI8x16U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extadd_Pairwise_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extadd_Pairwise_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extadd_Pairwise_I16x8_S", pc, code, stack);
         OpHelpers.i32x4ExtaddPairwiseI16x8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extadd_Pairwise_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extadd_Pairwise_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extadd_Pairwise_I16x8_U", pc, code, stack);
         OpHelpers.i32x4ExtaddPairwiseI16x8U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Abs", pc, code, stack);
         OpHelpers.i16x8Abs(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Neg", pc, code, stack);
         OpHelpers.i16x8Neg(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Q15mulr_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Q15mulr_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Q15mulr_Sat_S", pc, code, stack);
         OpHelpers.i16x8Q15mulrSatS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_AllTrue(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_AllTrue(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_AllTrue", pc, code, stack);
         OpHelpers.i16x8AllTrue(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Bitmask(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Bitmask(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Bitmask", pc, code, stack);
         OpHelpers.i16x8Bitmask(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Narrow_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Narrow_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Narrow_I32x4_S", pc, code, stack);
         OpHelpers.i16x8NarrowI32x4S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Narrow_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Narrow_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Narrow_I32x4_U", pc, code, stack);
         OpHelpers.i16x8NarrowI32x4U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extend_Low_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extend_Low_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extend_Low_I8x16_S", pc, code, stack);
         OpHelpers.i16x8ExtendLowI8x16S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extend_High_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extend_High_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extend_High_I8x16_S", pc, code, stack);
         OpHelpers.i16x8ExtendHighI8x16S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extend_Low_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extend_Low_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extend_Low_I8x16_U", pc, code, stack);
         OpHelpers.i16x8ExtendLowI8x16U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
-    fn op_I16x8_Extend_High_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extend_High_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extend_High_I8x16_U", pc, code, stack);
         OpHelpers.i16x8ExtendHighI8x16U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Shl", pc, code, stack);
         OpHelpers.i16x8Shl(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Shr_S", pc, code, stack);
         OpHelpers.i16x8ShrS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Shr_U", pc, code, stack);
         OpHelpers.i16x8ShrU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Add", pc, code, stack);
         OpHelpers.i16x8Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Add_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Add_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Add_Sat_S", pc, code, stack);
         OpHelpers.i16x8AddSatS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Add_Sat_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Add_Sat_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Add_Sat_U", pc, code, stack);
         OpHelpers.i16x8AddSatU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Sub", pc, code, stack);
         OpHelpers.i16x8Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Sub_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Sub_Sat_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Sub_Sat_S", pc, code, stack);
         OpHelpers.i16x8SubSatS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Sub_Sat_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Sub_Sat_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Sub_Sat_U", pc, code, stack);
         OpHelpers.i16x8SubSatU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Nearest(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Nearest(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Nearest", pc, code, stack);
         OpHelpers.f64x2Nearest(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Mul", pc, code, stack);
         OpHelpers.i16x8Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Min_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Min_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Min_S", pc, code, stack);
         OpHelpers.i16x8MinS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Min_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Min_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Min_U", pc, code, stack);
         OpHelpers.i16x8MinU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Max_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Max_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Max_S", pc, code, stack);
         OpHelpers.i16x8MaxS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Max_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Max_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Max_U", pc, code, stack);
         OpHelpers.i16x8MaxU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Avgr_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Avgr_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Avgr_U", pc, code, stack);
         OpHelpers.i16x8AvgrU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extmul_Low_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extmul_Low_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extmul_Low_I8x16_S", pc, code, stack);
         OpHelpers.i16x8ExtmulLowI8x16S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extmul_High_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extmul_High_I8x16_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extmul_High_I8x16_S", pc, code, stack);
         OpHelpers.i16x8ExtmulHighI8x16S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extmul_Low_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extmul_Low_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extmul_Low_I8x16_U", pc, code, stack);
         OpHelpers.i16x8ExtmulLowI8x16U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I16x8_Extmul_High_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I16x8_Extmul_High_I8x16_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I16x8_Extmul_High_I8x16_U", pc, code, stack);
         OpHelpers.i16x8ExtmulHighI8x16U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Abs", pc, code, stack);
         OpHelpers.i32x4Abs(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Neg", pc, code, stack);
         OpHelpers.i32x4Neg(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_AllTrue(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_AllTrue(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_AllTrue", pc, code, stack);
         OpHelpers.i32x4AllTrue(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Bitmask(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Bitmask(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Bitmask", pc, code, stack);
         OpHelpers.i32x4Bitmask(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extend_Low_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extend_Low_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extend_Low_I16x8_S", pc, code, stack);
         OpHelpers.i32x4ExtendLowI16x8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extend_High_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extend_High_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extend_High_I16x8_S", pc, code, stack);
         OpHelpers.i32x4ExtendHighI16x8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extend_Low_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extend_Low_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extend_Low_I16x8_U", pc, code, stack);
         OpHelpers.i32x4ExtendLowI16x8U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extend_High_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extend_High_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extend_High_I16x8_U", pc, code, stack);
         OpHelpers.i32x4ExtendHighI16x8U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Shl", pc, code, stack);
         OpHelpers.i32x4Shl(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Shr_S", pc, code, stack);
         OpHelpers.i32x4ShrS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Shr_U", pc, code, stack);
         OpHelpers.i32x4ShrU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Abs", pc, code, stack);
         OpHelpers.i64x2Abs(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Neg", pc, code, stack);
         OpHelpers.i64x2Neg(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_AllTrue(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_AllTrue(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_AllTrue", pc, code, stack);
         OpHelpers.i64x2AllTrue(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Bitmask(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Bitmask(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Bitmask", pc, code, stack);
         OpHelpers.i64x2Bitmask(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Extend_Low_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extend_Low_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Extend_Low_I32x4_S", pc, code, stack);
         OpHelpers.i64x2ExtendLowI32x4S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Extend_High_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extend_High_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Extend_High_I32x4_S", pc, code, stack);
         OpHelpers.i64x2ExtendHighI32x4S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Extend_Low_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extend_Low_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Extend_Low_I32x4_U", pc, code, stack);
         OpHelpers.i64x2ExtendLowI32x4U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Extend_High_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extend_High_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Extend_High_I32x4_U", pc, code, stack);
         OpHelpers.i64x2ExtendHighI32x4U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Shl(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Shl", pc, code, stack);
         OpHelpers.i64x2Shl(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Shr_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Shr_S", pc, code, stack);
         OpHelpers.i64x2ShrS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Shr_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Shr_U", pc, code, stack);
         OpHelpers.i64x2ShrU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Add", pc, code, stack);
         OpHelpers.i32x4Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Sub", pc, code, stack);
         OpHelpers.i32x4Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Mul", pc, code, stack);
         OpHelpers.i32x4Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Min_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Min_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Min_S", pc, code, stack);
         OpHelpers.i32x4MinS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Min_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Min_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Min_U", pc, code, stack);
         OpHelpers.i32x4MinU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Max_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Max_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Max_S", pc, code, stack);
         OpHelpers.i32x4MaxS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Max_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Max_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Max_U", pc, code, stack);
         OpHelpers.i32x4MaxU(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Dot_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Dot_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Dot_I16x8_S", pc, code, stack);
         OpHelpers.i32x4DotI16x8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extmul_Low_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extmul_Low_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extmul_Low_I16x8_S", pc, code, stack);
         OpHelpers.i32x4ExtmulLowI16x8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extmul_High_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extmul_High_I16x8_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extmul_High_I16x8_S", pc, code, stack);
         OpHelpers.i32x4ExtmulHighI16x8S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extmul_Low_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extmul_Low_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extmul_Low_I16x8_U", pc, code, stack);
         OpHelpers.i32x4ExtmulLowI16x8U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Extmul_High_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Extmul_High_I16x8_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Extmul_High_I16x8_U", pc, code, stack);
         OpHelpers.i32x4ExtmulHighI16x8U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Add", pc, code, stack);
         OpHelpers.i64x2Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Sub", pc, code, stack);
         OpHelpers.i64x2Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_Mul", pc, code, stack);
         OpHelpers.i64x2Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_EQ(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_EQ", pc, code, stack);
         OpHelpers.i64x2EQ(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_NE(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_NE(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_NE", pc, code, stack);
         OpHelpers.i64x2NE(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_LT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_LT_S", pc, code, stack);
         OpHelpers.i64x2LTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_GT_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_GT_S", pc, code, stack);
         OpHelpers.i64x2GTS(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_LE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_LE_S", pc, code, stack);
         OpHelpers.i64x2LES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_GE_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_GE_S", pc, code, stack);
         OpHelpers.i64x2GES(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I64x2_Extmul_Low_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extmul_Low_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_GE_S", pc, code, stack);
         OpHelpers.i64x2ExtmulLowI32x4S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
-    fn op_I64x2_Extmul_High_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extmul_High_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_GE_S", pc, code, stack);
         OpHelpers.i64x2ExtmulHighI32x4S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
-    fn op_I64x2_Extmul_Low_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extmul_Low_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_GE_S", pc, code, stack);
         OpHelpers.i64x2ExtmulLowI32x4U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
-    fn op_I64x2_Extmul_High_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I64x2_Extmul_High_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I64x2_GE_S", pc, code, stack);
         OpHelpers.i64x2ExtmulHighI32x4U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Abs", pc, code, stack);
         OpHelpers.f32x4Abs(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Neg", pc, code, stack);
         OpHelpers.f32x4Neg(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Sqrt(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Sqrt(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Sqrt", pc, code, stack);
         OpHelpers.f32x4Sqrt(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Add", pc, code, stack);
         OpHelpers.f32x4Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Sub", pc, code, stack);
         OpHelpers.f32x4Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Mul", pc, code, stack);
         OpHelpers.f32x4Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Div(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Div(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Div", pc, code, stack);
         OpHelpers.f32x4Div(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Min(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Min(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Min", pc, code, stack);
         OpHelpers.f32x4Min(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Max(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Max(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Max", pc, code, stack);
         OpHelpers.f32x4Max(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_PMin(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_PMin(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_PMin", pc, code, stack);
         OpHelpers.f32x4PMin(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_PMax(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_PMax(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_PMax", pc, code, stack);
         OpHelpers.f32x4PMax(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Abs(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Abs", pc, code, stack);
         OpHelpers.f64x2Abs(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Neg(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Neg", pc, code, stack);
         OpHelpers.f64x2Neg(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Sqrt(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Sqrt(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Sqrt", pc, code, stack);
         OpHelpers.f64x2Sqrt(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Add(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Add(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Add", pc, code, stack);
         OpHelpers.f64x2Add(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Sub(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Sub", pc, code, stack);
         OpHelpers.f64x2Sub(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Mul(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Mul", pc, code, stack);
         OpHelpers.f64x2Mul(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Div(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Div(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Div", pc, code, stack);
         OpHelpers.f64x2Div(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Min(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Min(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Min", pc, code, stack);
         OpHelpers.f64x2Min(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Max(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Max(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Max", pc, code, stack);
         OpHelpers.f64x2Max(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_PMin(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_PMin(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_PMin", pc, code, stack);
         OpHelpers.f64x2PMin(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_PMax(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_PMax(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_PMax", pc, code, stack);
         OpHelpers.f64x2PMax(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Trunc_Sat_F32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Trunc_Sat_F32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Trunc_Sat_F32x4_S", pc, code, stack);
         OpHelpers.f32x4TruncSatF32x4S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Trunc_Sat_F32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Trunc_Sat_F32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Trunc_Sat_F32x4_U", pc, code, stack);
         OpHelpers.f32x4TruncSatF32x4U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Convert_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Convert_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Convert_I32x4_S", pc, code, stack);
         OpHelpers.f32x4ConvertI32x4S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F32x4_Convert_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F32x4_Convert_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F32x4_Convert_I32x4_U", pc, code, stack);
         OpHelpers.f32x4ConvertI32x4U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Trunc_Sat_F64x2_S_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Trunc_Sat_F64x2_S_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Trunc_Sat_F64x2_S_Zero", pc, code, stack);
         OpHelpers.i32x4TruncSatF64x2SZero(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_I32x4_Trunc_Sat_F64x2_U_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_I32x4_Trunc_Sat_F64x2_U_Zero(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("I32x4_Trunc_Sat_F64x2_U_Zero", pc, code, stack);
         OpHelpers.i32x4TruncSatF64x2UZero(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Convert_Low_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Convert_Low_I32x4_S(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Convert_Low_I32x4_S", pc, code, stack);
         OpHelpers.f64x2ConvertLowI32x4S(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 
-    fn op_F64x2_Convert_Low_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) anyerror!void {
+    fn op_F64x2_Convert_Low_I32x4_U(pc: u32, code: [*]const Instruction, stack: *Stack) TrapError!void {
         try preamble("F64x2_Convert_Low_I32x4_U", pc, code, stack);
         OpHelpers.f64x2ConvertLowI32x4U(stack);
         try @call(.always_tail, InstructionFuncs.lookup(code[pc + 1].opcode), .{ pc + 1, code, stack });
     }
 };
+
+fn calcNumValues(types: []const ValType) u16 {
+    var num: u16 = 0;
+    for (types) |valtype| {
+        num += switch (valtype) {
+            .V128 => 2,
+            else => 1,
+        };
+    }
+    return num;
+}
 
 pub const StackVM = struct {
     const TrapType = enum {
@@ -3248,7 +3293,7 @@ pub const StackVM = struct {
     };
 
     const DebugState = struct {
-        trapped_opcodes: std.ArrayList(TrappedOpcode),
+        trapped_opcodes: std.array_list.Managed(TrappedOpcode),
         pc: u32 = 0,
         trap_counter: u32 = 0, // used for trapping on step
         is_invoking: bool = false,
@@ -3272,18 +3317,22 @@ pub const StackVM = struct {
     } else void;
 
     stack: Stack,
-    functions: std.ArrayList(FunctionInstance),
+    instructions: std.array_list.Managed(Instruction),
+    functions: std.array_list.Managed(FunctionInstance),
+    host_function_import_data: std.array_list.Managed(HostFunctionData),
     debug_state: ?DebugState,
     meter_state: MeterState,
 
     pub fn fromVM(vm: *VM) *StackVM {
-        return @as(*StackVM, @alignCast(@ptrCast(vm.impl)));
+        return @as(*StackVM, @ptrCast(@alignCast(vm.impl)));
     }
 
     pub fn init(vm: *VM) void {
         var self: *StackVM = fromVM(vm);
         self.stack = Stack.init(vm.allocator);
-        self.functions = std.ArrayList(FunctionInstance).init(vm.allocator);
+        self.instructions = std.array_list.Managed(Instruction).init(vm.allocator);
+        self.functions = std.array_list.Managed(FunctionInstance).init(vm.allocator);
+        self.host_function_import_data = std.array_list.Managed(HostFunctionData).init(vm.allocator);
         self.debug_state = null;
     }
 
@@ -3291,20 +3340,21 @@ pub const StackVM = struct {
         var self: *StackVM = fromVM(vm);
 
         self.functions.deinit();
-
+        self.host_function_import_data.deinit();
+        self.instructions.deinit();
         self.stack.deinit();
         if (self.debug_state) |*debug_state| {
             debug_state.trapped_opcodes.deinit();
         }
     }
 
-    pub fn instantiate(vm: *VM, module: *ModuleInstance, opts: ModuleInstantiateOpts) anyerror!void {
+    pub fn instantiate(vm: *VM, module: *ModuleInstance, opts: ModuleInstantiateOpts) InstantiateError!void {
         var self: *StackVM = fromVM(vm);
 
         if (opts.enable_debug) {
             self.debug_state = DebugState{
                 .pc = 0,
-                .trapped_opcodes = std.ArrayList(TrappedOpcode).init(vm.allocator),
+                .trapped_opcodes = std.array_list.Managed(TrappedOpcode).init(vm.allocator),
             };
         }
 
@@ -3317,36 +3367,116 @@ pub const StackVM = struct {
             .max_frames = @as(u16, @intFromFloat(stack_size_f * 0.01)),
         });
 
+        // vm keeps a copy of the instructions to mutate some of them
+        try self.instructions.appendSlice(module.module_def.code.instructions.items);
+
+        var locals_remap: std.array_list.Managed(u32) = .init(vm.allocator);
+        defer locals_remap.deinit();
+        try locals_remap.ensureTotalCapacity(1024);
+
         try self.functions.ensureTotalCapacity(module.module_def.functions.items.len);
         for (module.module_def.functions.items, 0..) |*def_func, i| {
             const func_type: *const FunctionTypeDefinition = &module.module_def.types.items[def_func.type_index];
             const param_types: []const ValType = func_type.getParams();
+            const local_types: []const ValType = def_func.locals(module.module_def);
 
-            const locals: []const ValType = def_func.locals(module.module_def);
-            const num_locals: u32 = @intCast(locals.len);
-            const num_params: u16 = @intCast(param_types.len);
-            const num_values: u32 = @intCast(def_func.stack_stats.values);
+            var num_params: u16 = 0;
+            var num_locals: u32 = 0;
+
+            // remap local indices to ensure v128 gets 2 local slots
+            try locals_remap.resize(0);
+            {
+                for (param_types) |valtype| {
+                    const num_values: u16 = switch (valtype) {
+                        .V128 => 2,
+                        else => 1,
+                    };
+                    try locals_remap.append(num_params);
+                    num_params += num_values;
+                }
+
+                for (local_types) |valtype| {
+                    const num_values: u16 = switch (valtype) {
+                        .V128 => 2,
+                        else => 1,
+                    };
+                    try locals_remap.append(num_params + num_locals);
+                    num_locals += num_values;
+                }
+            }
+
+            const return_types: []const ValType = func_type.getReturns();
+            const num_returns: u16 = calcNumValues(return_types);
+
+            const max_values_on_stack: u32 = @intCast(def_func.stack_stats.values);
 
             const f = FunctionInstance{
                 .type_def_index = def_func.type_index,
                 .def_index = @as(u32, @intCast(i)),
-                .code = module.module_def.code.instructions.items.ptr,
+                .code = self.instructions.items.ptr,
                 .instructions_begin = def_func.instructions_begin,
                 .num_locals = num_locals,
                 .num_params = num_params,
-                .num_returns = @intCast(func_type.getReturns().len),
+                .num_returns = num_returns,
 
                 // maximum number of values that can be on the stack for this function
-                .max_values = num_values + num_locals + num_params,
+                .max_values = max_values_on_stack + num_locals + num_params,
                 .max_labels = @intCast(def_func.stack_stats.labels),
 
                 .module = module,
             };
             try self.functions.append(f);
+
+            // fixup immediates
+            std.debug.assert(self.instructions.items.len == module.module_def.code.validation_immediates.items.len);
+            const func_code: []Instruction = self.instructions.items[def_func.instructions_begin..def_func.instructions_end];
+            const func_validation_immediates: []ValidationImmediates = module.module_def.code.validation_immediates.items[def_func.instructions_begin..def_func.instructions_end];
+            for (func_code, func_validation_immediates) |*instruction, validation_immediates| {
+                switch (instruction.opcode) {
+                    .Local_Get, .Local_Set, .Local_Tee, .Local_Get_V128, .Local_Set_V128, .Local_Tee_V128 => {
+                        const remapped_index = locals_remap.items[instruction.immediate.Index];
+                        instruction.immediate.Index = remapped_index;
+                    },
+                    .Block, .Loop, .If => {
+                        const immediates = validation_immediates.BlockOrIf;
+                        const block_return_types = immediates.block_value.getBlocktypeReturnTypes(immediates.block_type, module.module_def);
+                        const num_block_returns: u16 = calcNumValues(block_return_types);
+
+                        if (instruction.opcode == .If) {
+                            instruction.immediate.If.num_returns = num_block_returns;
+                        } else {
+                            instruction.immediate.Block.num_returns = num_block_returns;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // precalculate some data for function imports to avoid having to do this at runtime
+        try self.host_function_import_data.ensureTotalCapacity(module.store.imports.functions.items.len);
+        for (module.store.imports.functions.items) |import| {
+            const data: HostFunctionData = switch (import.data) {
+                .Host => |host_import| blk: {
+                    const params: []const ValType = host_import.func_type_def.getParams();
+                    const returns: []const ValType = host_import.func_type_def.getReturns();
+
+                    const num_param_values: u16 = calcNumValues(params);
+                    const num_return_values: u16 = calcNumValues(returns);
+
+                    const data: HostFunctionData = .{
+                        .num_param_values = num_param_values,
+                        .num_return_values = num_return_values,
+                    };
+                    break :blk data;
+                },
+                .Wasm => .{},
+            };
+            self.host_function_import_data.appendAssumeCapacity(data);
         }
     }
 
-    pub fn invoke(vm: *VM, module: *ModuleInstance, handle: FunctionHandle, params: [*]const Val, returns: [*]Val, opts: InvokeOpts) anyerror!void {
+    pub fn invoke(vm: *VM, module: *ModuleInstance, handle: FunctionHandle, params: [*]const Val, returns: [*]Val, opts: InvokeOpts) TrapError!void {
         var self: *StackVM = fromVM(vm);
 
         if (self.debug_state) |*debug_state| {
@@ -3367,10 +3497,72 @@ pub const StackVM = struct {
             }
         }
 
-        try self.invokeInternal(module, handle.index, params, returns);
+        const func: *const FunctionInstance = &self.functions.items[handle.index];
+        const func_def: *const FunctionDefinition = &module.module_def.functions.items[func.def_index];
+        const type_def: *const FunctionTypeDefinition = func_def.typeDefinition(module.module_def);
+        const param_types: []const ValType = type_def.getParams();
+        const return_types: []const ValType = type_def.getReturns();
+
+        // use the count of params/returns from the type since it corresponds to the number of Vals. The function instances' param/return
+        // counts double count V128 as 2 parameters.
+        const params_slice = params[0..param_types.len];
+        var returns_slice = returns[0..return_types.len];
+
+        // Ensure any leftover stack state doesn't pollute this invoke. Can happen if the previous invoke returned an error.
+        self.stack.popAll();
+
+        // pushFrame() assumes the stack already contains the params to the function, so ensure they exist
+        // on the value stack
+        for (params_slice, param_types) |v, valtype| {
+            switch (valtype) {
+                .V128 => {
+                    const vec2: f64x2 = @bitCast(v.V128);
+                    self.stack.pushF64(vec2[0]);
+                    self.stack.pushF64(vec2[1]);
+                },
+                else => self.stack.pushI64(v.I64),
+            }
+        }
+
+        try self.stack.pushFrame(func, module);
+        self.stack.pushLabel(func.num_returns, @intCast(func_def.continuation));
+
+        DebugTrace.traceFunction(module, self.stack.num_frames, func.def_index);
+
+        if (config.vm_kind == .tailcall) {
+            try InstructionFuncs.run(@intCast(func.instructions_begin), func.code, &self.stack);
+        } else {
+            try self.run(@intCast(func.instructions_begin), func.code);
+        }
+
+        if (returns_slice.len > 0) {
+            std.debug.assert(returns_slice.len == return_types.len);
+            for (0..returns_slice.len) |i| {
+                const index = returns_slice.len - 1 - i;
+                switch (return_types[index]) {
+                    .V128 => {
+                        var vec2: f64x2 = undefined;
+                        vec2[1] = self.stack.popF64();
+                        vec2[0] = self.stack.popF64();
+                        returns_slice[index].V128 = @bitCast(vec2);
+                    },
+                    else => {
+                        returns_slice[index].I64 = self.stack.popI64();
+                    },
+                }
+            }
+        }
+
+        if (self.debug_state) |*debug_state| {
+            debug_state.onInvokeFinished();
+        }
+
+        if (metering.enabled and self.meter_state.enabled) {
+            self.meter_state.onInvokeFinished();
+        }
     }
 
-    pub fn resumeInvoke(vm: *VM, module: *ModuleInstance, returns: []Val, opts: ResumeInvokeOpts) anyerror!void {
+    pub fn resumeInvoke(vm: *VM, module: *ModuleInstance, returns: []Val, opts: ResumeInvokeOpts) TrapError!void {
         var self: *StackVM = fromVM(vm);
 
         var pc: u32 = 0;
@@ -3398,14 +3590,33 @@ pub const StackVM = struct {
             return error.TrapInvalidResume;
         }
 
-        const op_func = InstructionFuncs.lookup(opcode);
-        try op_func(pc, module.module_def.code.instructions.items.ptr, &self.stack);
+        const func: *const FunctionInstance = self.stack.topFrame().func;
+
+        if (config.vm_kind == .tailcall) {
+            try InstructionFuncs.run(pc, func.code, &self.stack);
+        } else {
+            try self.run(pc, func.code);
+        }
 
         if (returns.len > 0) {
-            var index: i32 = @as(i32, @intCast(returns.len - 1));
-            while (index >= 0) {
-                returns[@as(usize, @intCast(index))] = self.stack.popValue();
-                index -= 1;
+            const func_def: *const FunctionDefinition = &module.module_def.functions.items[func.def_index];
+            const type_def: *const FunctionTypeDefinition = func_def.typeDefinition(module.module_def);
+            const return_types: []const ValType = type_def.getReturns();
+            std.debug.assert(returns.len == return_types.len);
+
+            for (0..returns.len) |i| {
+                const index = returns.len - 1 - i;
+                switch (return_types[index]) {
+                    .V128 => {
+                        var vec2: f64x2 = undefined;
+                        vec2[1] = self.stack.popF64();
+                        vec2[0] = self.stack.popF64();
+                        returns[index].V128 = @bitCast(vec2);
+                    },
+                    else => {
+                        returns[index].I64 = self.stack.popI64();
+                    },
+                }
             }
         }
 
@@ -3417,7 +3628,7 @@ pub const StackVM = struct {
         }
     }
 
-    pub fn step(vm: *VM, module: *ModuleInstance, returns: []Val) !void {
+    pub fn step(vm: *VM, module: *ModuleInstance, returns: []Val) TrapError!void {
         var self: *StackVM = fromVM(vm);
 
         const debug_state = &self.debug_state.?;
@@ -3433,7 +3644,7 @@ pub const StackVM = struct {
         try vm.resumeInvoke(module, returns, .{});
     }
 
-    pub fn setDebugTrap(vm: *VM, module: *ModuleInstance, wasm_address: u32, mode: DebugTrapInstructionMode) !bool {
+    pub fn setDebugTrap(vm: *VM, module: *ModuleInstance, wasm_address: u32, mode: DebugTrapInstructionMode) AllocError!bool {
         var self: *StackVM = fromVM(vm);
 
         std.debug.assert(self.debug_state != null);
@@ -3468,10 +3679,10 @@ pub const StackVM = struct {
         return false;
     }
 
-    pub fn formatBacktrace(vm: *VM, indent: u8, allocator: std.mem.Allocator) anyerror!std.ArrayList(u8) {
+    pub fn formatBacktrace(vm: *VM, indent: u8, allocator: std.mem.Allocator) anyerror!std.array_list.Managed(u8) {
         var self: *StackVM = fromVM(vm);
 
-        var buffer = std.ArrayList(u8).init(allocator);
+        var buffer = std.array_list.Managed(u8).init(allocator);
         try buffer.ensureTotalCapacity(512);
         var writer = buffer.writer();
 
@@ -3487,7 +3698,7 @@ pub const StackVM = struct {
             const name_section: *const NameCustomSection = &frame.func.module.module_def.name_section;
             const module_name = name_section.getModuleName();
 
-            const func_name_index: usize = frame.func.def_index + frame.func.module.module_def.imports.functions.items.len;
+            const func_name_index: usize = frame.func.def_index;
             const function_name = name_section.findFunctionName(func_name_index);
 
             try writer.print("{}: {s}!{s}\n", .{ reverse_index, module_name, function_name });
@@ -3509,51 +3720,7 @@ pub const StackVM = struct {
         return if (func.isNull()) func else FuncRef{ .func = &self.functions.items[func.index] };
     }
 
-    fn invokeInternal(self: *StackVM, module: *ModuleInstance, func_instance_index: usize, params: [*]const Val, returns: [*]Val) !void {
-        const func: FunctionInstance = self.functions.items[func_instance_index];
-        const func_def: FunctionDefinition = module.module_def.functions.items[func.def_index];
-
-        const params_slice = params[0..func.num_params];
-        var returns_slice = returns[0..func.num_returns];
-
-        // Ensure any leftover stack state doesn't pollute this invoke. Can happen if the previous invoke returned an error.
-        self.stack.popAll();
-
-        // pushFrame() assumes the stack already contains the params to the function, so ensure they exist
-        // on the value stack
-        for (params_slice) |v| {
-            self.stack.pushValue(v);
-        }
-
-        try self.stack.pushFrame(&func, module);
-        try self.stack.pushLabel(func.num_returns, @intCast(func_def.continuation));
-
-        DebugTrace.traceFunction(module, self.stack.num_frames, func.def_index);
-
-        if (config.vm_kind == .tailcall) {
-            try InstructionFuncs.run(@intCast(func.instructions_begin), func.code, &self.stack);
-        } else {
-            try self.run(@intCast(func.instructions_begin), func.code);
-        }
-
-        if (returns_slice.len > 0) {
-            var index: i32 = @as(i32, @intCast(returns_slice.len - 1));
-            while (index >= 0) {
-                returns_slice[@as(usize, @intCast(index))] = self.stack.popValue();
-                index -= 1;
-            }
-        }
-
-        if (self.debug_state) |*debug_state| {
-            debug_state.onInvokeFinished();
-        }
-
-        if (metering.enabled and self.meter_state.enabled) {
-            self.meter_state.onInvokeFinished();
-        }
-    }
-
-    fn run(self: *StackVM, start_pc: u32, start_code: [*]const Instruction) anyerror!void {
+    fn run(self: *StackVM, start_pc: u32, start_code: [*]const Instruction) TrapError!void {
         var pc: u32 = start_pc;
         var code: [*]const Instruction = start_code;
         const stack = &self.stack;
@@ -3582,21 +3749,20 @@ pub const StackVM = struct {
 
             Opcode.Block => {
                 try preamble("Block", pc, code, stack);
-                try OpHelpers.block(pc, code, stack);
+                OpHelpers.block(pc, code, stack);
                 pc += 1;
                 continue :interpret code[pc].opcode;
             },
 
             Opcode.Loop => {
                 try preamble("Loop", pc, code, stack);
-                try OpHelpers.loop(pc, code, stack);
+                OpHelpers.loop(pc, code, stack);
                 pc += 1;
                 continue :interpret code[pc].opcode;
             },
 
             Opcode.If => {
                 try preamble("If", pc, code, stack);
-
                 pc = OpHelpers.@"if"(pc, code, stack);
                 continue :interpret code[pc].opcode;
             },
@@ -3609,14 +3775,12 @@ pub const StackVM = struct {
 
             Opcode.Else => {
                 try preamble("Else", pc, code, stack);
-                // getting here means we reached the end of the if opcode chain, so skip to the true end opcode
                 pc = OpHelpers.@"else"(pc, code);
                 continue :interpret code[pc].opcode;
             },
 
             Opcode.End => {
                 try preamble("End", pc, code, stack);
-
                 const next = OpHelpers.end(pc, code, stack) orelse return;
                 pc = next.continuation;
                 code = next.code;
@@ -3657,7 +3821,6 @@ pub const StackVM = struct {
 
             Opcode.Call_Local => {
                 try preamble("Call_Local", pc, code, stack);
-
                 const next = try OpHelpers.callLocal(pc, code, stack);
                 pc = next.continuation;
                 code = next.code;
@@ -3666,9 +3829,7 @@ pub const StackVM = struct {
 
             Opcode.Call_Import => {
                 try preamble("Call_Import", pc, code, stack);
-
                 const next = try OpHelpers.callImport(pc, code, stack);
-
                 pc = next.continuation;
                 code = next.code;
                 continue :interpret code[pc].opcode;
@@ -3676,9 +3837,7 @@ pub const StackVM = struct {
 
             Opcode.Call_Indirect => {
                 try preamble("Call_Indirect", pc, code, stack);
-
                 const next = try OpHelpers.callIndirect(pc, code, stack);
-
                 pc = next.continuation;
                 code = next.code;
                 continue :interpret code[pc].opcode;
@@ -3691,20 +3850,28 @@ pub const StackVM = struct {
                 continue :interpret code[pc].opcode;
             },
 
+            Opcode.Drop_V128 => {
+                try preamble("Drop_V128", pc, code, stack);
+                OpHelpers.dropV128(stack);
+                pc += 1;
+                continue :interpret code[pc].opcode;
+            },
+
             Opcode.Select => {
                 try preamble("Select", pc, code, stack);
-
                 OpHelpers.select(stack);
-
                 pc += 1;
                 continue :interpret code[pc].opcode;
             },
 
             Opcode.Select_T => {
-                try preamble("Select_T", pc, code, stack);
+                // should have been switched to Select in validation
+                unreachable;
+            },
 
-                OpHelpers.selectT(stack);
-
+            Opcode.Select_V128 => {
+                try preamble("SelectV128", pc, code, stack);
+                OpHelpers.selectV128(stack);
                 pc += 1;
                 continue :interpret code[pc].opcode;
             },
@@ -3718,7 +3885,6 @@ pub const StackVM = struct {
 
             Opcode.Local_Set => {
                 try preamble("Local_Set", pc, code, stack);
-
                 OpHelpers.localSet(pc, code, stack);
                 pc += 1;
                 continue :interpret code[pc].opcode;
@@ -3727,6 +3893,27 @@ pub const StackVM = struct {
             Opcode.Local_Tee => {
                 try preamble("Local_Tee", pc, code, stack);
                 OpHelpers.localTee(pc, code, stack);
+                pc += 1;
+                continue :interpret code[pc].opcode;
+            },
+
+            Opcode.Local_Get_V128 => {
+                try preamble("Local_Get_V128", pc, code, stack);
+                OpHelpers.localGetV128(pc, code, stack);
+                pc += 1;
+                continue :interpret code[pc].opcode;
+            },
+
+            Opcode.Local_Set_V128 => {
+                try preamble("Local_Set_V128", pc, code, stack);
+                OpHelpers.localSetV128(pc, code, stack);
+                pc += 1;
+                continue :interpret code[pc].opcode;
+            },
+
+            Opcode.Local_Tee_V128 => {
+                try preamble("Local_Tee_V128", pc, code, stack);
+                OpHelpers.localTeeV128(pc, code, stack);
                 pc += 1;
                 continue :interpret code[pc].opcode;
             },
@@ -3741,6 +3928,20 @@ pub const StackVM = struct {
             Opcode.Global_Set => {
                 try preamble("Global_Set", pc, code, stack);
                 OpHelpers.globalSet(pc, code, stack);
+                pc += 1;
+                continue :interpret code[pc].opcode;
+            },
+
+            Opcode.Global_Get_V128 => {
+                try preamble("Global_Get_V128", pc, code, stack);
+                OpHelpers.globalGetV128(pc, code, stack);
+                pc += 1;
+                continue :interpret code[pc].opcode;
+            },
+
+            Opcode.Global_Set_V128 => {
+                try preamble("Global_Set_V128", pc, code, stack);
+                OpHelpers.globalSetV128(pc, code, stack);
                 pc += 1;
                 continue :interpret code[pc].opcode;
             },
@@ -4860,7 +5061,7 @@ pub const StackVM = struct {
 
             Opcode.Ref_Null => {
                 try preamble("Ref_Null", pc, code, stack);
-                try OpHelpers.refNull(pc, code, stack);
+                try OpHelpers.refNull(stack);
                 pc += 1;
                 continue :interpret code[pc].opcode;
             },

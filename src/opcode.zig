@@ -21,13 +21,20 @@ pub const Opcode = enum(u16) {
     Call_Import, // Has no corresponding mapping in WasmOpcode, only calls imported functions
     Call_Indirect,
     Drop,
+    Drop_V128, // Has no corresponding mapping in WasmOpcode
     Select,
     Select_T,
+    Select_V128,
     Local_Get,
     Local_Set,
     Local_Tee,
+    Local_Get_V128, // Has no corresponding mapping in WasmOpcode
+    Local_Set_V128, // Has no corresponding mapping in WasmOpcode
+    Local_Tee_V128, // Has no corresponding mapping in WasmOpcode
     Global_Get,
     Global_Set,
+    Global_Get_V128, // Has no corresponding mapping in WasmOpcode
+    Global_Set_V128, // Has no corresponding mapping in WasmOpcode
     Table_Get,
     Table_Set,
     I32_Load,
@@ -913,30 +920,6 @@ pub const WasmOpcode = enum(u16) {
         }
         std.debug.assert(opcode != .Invalid);
         return opcode;
-    }
-
-    pub fn decode(reader: anytype) !WasmOpcode {
-        const byte = try reader.readByte();
-        var wasm_op: WasmOpcode = undefined;
-        if (byte == 0xFC or byte == 0xFD) {
-            const type_opcode = try common.decodeLEB128(u32, reader);
-            if (type_opcode > std.math.maxInt(u8)) {
-                return error.MalformedIllegalOpcode;
-            }
-            const byte2 = @as(u8, @intCast(type_opcode));
-            var extended: u16 = byte;
-            extended = extended << 8;
-            extended |= byte2;
-
-            wasm_op = std.meta.intToEnum(WasmOpcode, extended) catch {
-                return error.MalformedIllegalOpcode;
-            };
-        } else {
-            wasm_op = std.meta.intToEnum(WasmOpcode, byte) catch {
-                return error.MalformedIllegalOpcode;
-            };
-        }
-        return wasm_op;
     }
 };
 

@@ -20,9 +20,9 @@ jobs:
           submodules: 'true'
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.0
+          version: 0.15.1
 
       - name: Setup Python
         uses: actions/setup-python@v4
@@ -47,6 +47,10 @@ jobs:
         run: |
           zig build -Dvm_kind=${{ matrix.stack_kind }}
 
+      - name: Build (no wasi)
+        run: |
+          zig build -Dvm_kind=${{ matrix.stack_kind }} -Dwasi=false
+
       - name: Bench
         run: |
           zig build bench -Dvm_kind=${{ matrix.stack_kind }} -Doptimize=ReleaseFast
@@ -57,6 +61,11 @@ jobs:
           zig build -Dvm_kind=${{ matrix.stack_kind }} -Dtarget=x86-windows-gnu
           zig build -Dvm_kind=${{ matrix.stack_kind }} -Dtarget=x86-linux-gnu
           zig build -Dvm_kind=${{ matrix.stack_kind }} -Dtarget=arm-linux-gnueabi
+
+      - name: Aarch64 builds
+        if: runner.os == 'Linux'
+        run: |
+          zig build -Dvm_kind=${{ matrix.stack_kind }} -Dtarget=aarch64-linux-musl
 
       - name: Run unit tests
         run: |
