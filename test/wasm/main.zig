@@ -471,6 +471,7 @@ fn parseCommands(json_path: []const u8, allocator: std.mem.Allocator, io: std.Io
             var module: []const u8 = try _allocator.dupe(u8, fallback_module);
             const json_module_or_null = json_action.object.getPtr("module");
             if (json_module_or_null) |json_module| {
+                _allocator.free(module);
                 module = try _allocator.dupe(u8, json_module.string);
             }
 
@@ -495,9 +496,11 @@ fn parseCommands(json_path: []const u8, allocator: std.mem.Allocator, io: std.Io
 
     // print("json_path: {s}\n", .{json_path});
     const json_data = try std.Io.Dir.cwd().readFileAlloc(io, json_path, allocator, .limited(1024 * 1024 * 8));
+    defer allocator.free(json_data);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_data, .{});
+    defer parsed.deinit();
 
-    var fallback_module: []const u8 = "";
+    var fallback_module: []const u8 = try allocator.dupe(u8, "");
     defer allocator.free(fallback_module);
 
     var commands = std.array_list.Managed(Command).init(allocator);
@@ -509,10 +512,12 @@ fn parseCommands(json_path: []const u8, allocator: std.mem.Allocator, io: std.Io
         if (strcmp("module", json_command_type.string)) {
             const json_filename = json_command.object.getPtr("filename").?;
             const filename: []const u8 = try allocator.dupe(u8, json_filename.string);
+            allocator.free(fallback_module);
             fallback_module = filename;
 
             var name = try allocator.dupe(u8, filename);
             if (json_command.object.getPtr("name")) |json_module_name| {
+                allocator.free(name);
                 name = try allocator.dupe(u8, json_module_name.string);
             }
 
@@ -578,22 +583,26 @@ fn parseCommands(json_path: []const u8, allocator: std.mem.Allocator, io: std.Io
             };
             try commands.append(command);
         } else if (strcmp("assert_malformed", json_command_type.string)) {
-            const command = Command{
+            var command = Command{
                 .AssertMalformed = CommandAssertMalformed{
                     .err = try Helpers.parseBadModuleError(&json_command, allocator),
                 },
             };
             if (std.mem.endsWith(u8, command.AssertMalformed.err.module, ".wasm")) {
                 try commands.append(command);
+            } else {
+                command.deinit(allocator);
             }
         } else if (strcmp("assert_invalid", json_command_type.string)) {
-            const command = Command{
+            var command = Command{
                 .AssertInvalid = CommandAssertInvalid{
                     .err = try Helpers.parseBadModuleError(&json_command, allocator),
                 },
             };
             if (std.mem.endsWith(u8, command.AssertInvalid.err.module, ".wasm")) {
                 try commands.append(command);
+            } else {
+                command.deinit(allocator);
             }
         } else if (strcmp("assert_unlinkable", json_command_type.string)) {
             const command = Command{
@@ -785,22 +794,22 @@ fn run(allocator: std.mem.Allocator, suite_path: []const u8, opts: *const TestOp
     // NOTE this shares the same copies of the import arrays, since the modules must share instances
     var imports = std.array_list.Managed(bytebox.ModuleImportPackage).init(allocator);
     defer {
-        const spectest_imports = imports.items[0];
+        // Destroy host-created objects before deinit frees the names/arrays
+        var spectest_imports = &imports.items[0];
         for (spectest_imports.tables.items) |*item| {
-            allocator.free(item.name);
             item.data.Host.deinit();
             allocator.destroy(item.data.Host);
         }
         for (spectest_imports.memories.items) |*item| {
-            allocator.free(item.name);
             item.data.Host.deinit();
             allocator.destroy(item.data.Host);
         }
         for (spectest_imports.globals.items) |*item| {
-            allocator.free(item.name);
             allocator.destroy(item.data.Host.def);
             allocator.destroy(item.data.Host);
         }
+        // deinit frees names, type lists, and backing arrays
+        spectest_imports.deinit();
 
         for (imports.items[1..]) |*item| {
             item.deinit();
@@ -854,8 +863,10 @@ fn run(allocator: std.mem.Allocator, suite_path: []const u8, opts: *const TestOp
 
         if (module.inst == null) {
             const module_path = try std.fs.path.join(allocator, &[_][]const u8{ suite_dir, module_filename });
+            defer allocator.free(module_path);
 
             const module_data = try std.Io.Dir.cwd().readFileAlloc(io, module_path, allocator, .limited(1024 * 1024 * 8));
+            defer allocator.free(module_data);
 
             var decode_expected_error: ?[]const u8 = null;
             switch (command.*) {

@@ -4,14 +4,38 @@ const core = @import("core.zig");
 
 const StringPool = @import("stringpool.zig");
 
-/// Compatibility wrappers for POSIX functions removed from std.posix in Zig 0.16.
+/// Compatibility wrappers for POSIX functions.
+/// On Linux, uses raw syscalls (std.os.linux) since std.c removed many wrappers in Zig 0.16.
+/// On other platforms (macOS, etc.), uses std.c wrappers.
 const posix_compat = struct {
     const posix = std.posix;
     const c = std.c;
+    const linux = std.os.linux;
+    const is_linux = builtin.os.tag == .linux;
     const PosixError = error{ AccessDenied, DeviceBusy, DiskQuota, FileBusy, FileNotFound, FileTooBig, InputOutput, IsDir, LinkQuotaExceeded, NameTooLong, NoDevice, NoSpaceLeft, NotDir, PathAlreadyExists, ProcessFdQuotaExceeded, ReadOnlyFileSystem, SymLinkLoop, SystemFdQuotaExceeded, SystemResources, Unexpected, WouldBlock };
 
-    fn mapErrno() PosixError {
-        return switch (@as(c.E, @enumFromInt(c._errno().*))) {
+    /// A platform-independent stat result containing the fields needed by WASI.
+    const StatResult = struct {
+        dev: u64,
+        ino: u64,
+        mode: std.posix.mode_t,
+        nlink: u64,
+        size: u64,
+        atim: posix.timespec,
+        mtim: posix.timespec,
+        ctim: posix.timespec,
+    };
+
+    fn mapLinuxErrno(rc: usize) PosixError {
+        return mapE(posix.errno(rc));
+    }
+
+    fn mapCErrno() PosixError {
+        return mapE(@enumFromInt(c._errno().*));
+    }
+
+    fn mapE(e: c.E) PosixError {
+        return switch (e) {
             .ACCES, .PERM => error.AccessDenied,
             .BUSY => error.DeviceBusy,
             .DQUOT => error.DiskQuota,
@@ -37,94 +61,209 @@ const posix_compat = struct {
     }
 
     fn close(fd: posix.fd_t) void {
-        _ = c.close(fd);
+        if (is_linux) {
+            _ = linux.close(fd);
+        } else {
+            _ = c.close(fd);
+        }
     }
 
     fn fcntl(fd: posix.fd_t, cmd: c_int, arg: usize) PosixError!usize {
-        const rc = c.fcntl(fd, cmd, @as(c_int, @intCast(arg)));
-        if (rc == -1) return mapErrno();
-        return @intCast(rc);
+        if (is_linux) {
+            const rc = linux.fcntl(fd, cmd, arg);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+            return rc;
+        } else {
+            const rc = c.fcntl(fd, cmd, @as(c_int, @intCast(arg)));
+            if (rc == -1) return mapCErrno();
+            return @intCast(rc);
+        }
     }
 
-    fn fstat(fd: posix.fd_t) PosixError!posix.Stat {
-        var stat: posix.Stat = undefined;
-        const rc = c.fstat(fd, &stat);
-        if (rc != 0) return mapErrno();
-        return stat;
+    fn fstat(fd: posix.fd_t) PosixError!StatResult {
+        if (is_linux) {
+            var stx: linux.Statx = undefined;
+            const mask: linux.STATX = .{
+                .TYPE = true,
+                .MODE = true,
+                .NLINK = true,
+                .INO = true,
+                .SIZE = true,
+                .ATIME = true,
+                .MTIME = true,
+                .CTIME = true,
+            };
+            const rc = linux.statx(fd, "\x00", linux.AT.EMPTY_PATH, mask, &stx);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+            return StatResult{
+                .dev = @as(u64, stx.dev_major) << 32 | stx.dev_minor,
+                .ino = stx.ino,
+                .mode = stx.mode,
+                .nlink = stx.nlink,
+                .size = stx.size,
+                .atim = .{ .sec = stx.atime.sec, .nsec = stx.atime.nsec },
+                .mtim = .{ .sec = stx.mtime.sec, .nsec = stx.mtime.nsec },
+                .ctim = .{ .sec = stx.ctime.sec, .nsec = stx.ctime.nsec },
+            };
+        } else {
+            var stat: c.Stat = undefined;
+            const rc = c.fstat(fd, &stat);
+            if (rc != 0) return mapCErrno();
+            return StatResult{
+                .dev = if (builtin.os.tag.isDarwin()) @as(u32, @bitCast(stat.dev)) else stat.dev,
+                .ino = stat.ino,
+                .mode = stat.mode,
+                .nlink = stat.nlink,
+                .size = if (std.math.cast(u64, stat.size)) |s| s else 0,
+                .atim = stat.atime(),
+                .mtim = stat.mtime(),
+                .ctim = stat.ctime(),
+            };
+        }
     }
 
     fn futimens(fd: posix.fd_t, times: *const [2]posix.timespec) PosixError!void {
-        const rc = c.futimens(fd, times);
-        if (rc != 0) return mapErrno();
+        if (is_linux) {
+            const rc = linux.futimens(fd, times);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.futimens(fd, times);
+            if (rc != 0) return mapCErrno();
+        }
     }
 
     fn lseek_SET(fd: posix.fd_t, offset: u64) PosixError!void {
-        const rc = c.lseek(fd, @intCast(offset), c.SEEK.SET);
-        if (rc == -1) return mapErrno();
+        if (is_linux) {
+            const rc = linux.lseek(fd, @intCast(offset), linux.SEEK.SET);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.lseek(fd, @intCast(offset), c.SEEK.SET);
+            if (rc == -1) return mapCErrno();
+        }
     }
 
     fn lseek_CUR_get(fd: posix.fd_t) PosixError!u64 {
-        const rc = c.lseek(fd, 0, c.SEEK.CUR);
-        if (rc == -1) return mapErrno();
-        return @intCast(rc);
+        if (is_linux) {
+            const rc = linux.lseek(fd, 0, linux.SEEK.CUR);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+            return rc;
+        } else {
+            const rc = c.lseek(fd, 0, c.SEEK.CUR);
+            if (rc == -1) return mapCErrno();
+            return @intCast(rc);
+        }
     }
 
     fn lseek_CUR(fd: posix.fd_t, offset: i64) PosixError!void {
-        const rc = c.lseek(fd, @intCast(offset), c.SEEK.CUR);
-        if (rc == -1) return mapErrno();
+        if (is_linux) {
+            const rc = linux.lseek(fd, offset, linux.SEEK.CUR);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.lseek(fd, @intCast(offset), c.SEEK.CUR);
+            if (rc == -1) return mapCErrno();
+        }
     }
 
     fn lseek_END(fd: posix.fd_t, offset: i64) PosixError!void {
-        const rc = c.lseek(fd, @intCast(offset), c.SEEK.END);
-        if (rc == -1) return mapErrno();
+        if (is_linux) {
+            const rc = linux.lseek(fd, offset, linux.SEEK.END);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.lseek(fd, @intCast(offset), c.SEEK.END);
+            if (rc == -1) return mapCErrno();
+        }
     }
 
     fn readv(fd: posix.fd_t, iov: []posix.iovec) PosixError!usize {
-        const rc = c.readv(fd, @ptrCast(iov.ptr), @intCast(iov.len));
-        if (rc == -1) return mapErrno();
-        return @intCast(rc);
+        if (is_linux) {
+            const rc = linux.readv(fd, @ptrCast(iov.ptr), iov.len);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+            return rc;
+        } else {
+            const rc = c.readv(fd, @ptrCast(iov.ptr), @intCast(iov.len));
+            if (rc == -1) return mapCErrno();
+            return @intCast(rc);
+        }
     }
 
     fn preadv(fd: posix.fd_t, iov: []posix.iovec, offset: u64) PosixError!usize {
-        const rc = c.preadv(fd, @ptrCast(iov.ptr), @intCast(iov.len), @intCast(offset));
-        if (rc == -1) return mapErrno();
-        return @intCast(rc);
+        if (is_linux) {
+            const rc = linux.preadv(fd, @ptrCast(iov.ptr), iov.len, @intCast(offset));
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+            return rc;
+        } else {
+            const rc = c.preadv(fd, @ptrCast(iov.ptr), @intCast(iov.len), @intCast(offset));
+            if (rc == -1) return mapCErrno();
+            return @intCast(rc);
+        }
     }
 
     fn writev(fd: posix.fd_t, iov: []const posix.iovec_const) PosixError!usize {
-        const rc = c.writev(fd, @ptrCast(iov.ptr), @intCast(iov.len));
-        if (rc == -1) return mapErrno();
-        return @intCast(rc);
+        if (is_linux) {
+            const rc = linux.writev(fd, @ptrCast(iov.ptr), iov.len);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+            return rc;
+        } else {
+            const rc = c.writev(fd, @ptrCast(iov.ptr), @intCast(iov.len));
+            if (rc == -1) return mapCErrno();
+            return @intCast(rc);
+        }
     }
 
     fn pwritev(fd: posix.fd_t, iov: []const posix.iovec_const, offset: u64) PosixError!usize {
-        const rc = c.pwritev(fd, @ptrCast(iov.ptr), @intCast(iov.len), @intCast(offset));
-        if (rc == -1) return mapErrno();
-        return @intCast(rc);
+        if (is_linux) {
+            const rc = linux.pwritev(fd, @ptrCast(iov.ptr), iov.len, @intCast(offset));
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+            return rc;
+        } else {
+            const rc = c.pwritev(fd, @ptrCast(iov.ptr), @intCast(iov.len), @intCast(offset));
+            if (rc == -1) return mapCErrno();
+            return @intCast(rc);
+        }
     }
 
     fn ftruncate(fd: posix.fd_t, length: u64) PosixError!void {
-        const rc = c.ftruncate(fd, @intCast(length));
-        if (rc != 0) return mapErrno();
+        if (is_linux) {
+            const rc = linux.ftruncate(fd, @intCast(length));
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.ftruncate(fd, @intCast(length));
+            if (rc != 0) return mapCErrno();
+        }
     }
 
     fn mkdirat(dirfd: posix.fd_t, path: anytype, mode: posix.mode_t) PosixError!void {
         const p = toPosixPath(path);
-        const rc = c.mkdirat(dirfd, &p, mode);
-        if (rc != 0) return mapErrno();
+        if (is_linux) {
+            const rc = linux.mkdirat(dirfd, &p, mode);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.mkdirat(dirfd, &p, mode);
+            if (rc != 0) return mapCErrno();
+        }
     }
 
     fn unlinkat(dirfd: posix.fd_t, path: anytype, flags: u32) PosixError!void {
         const p = toPosixPath(path);
-        const rc = c.unlinkat(dirfd, &p, @intCast(flags));
-        if (rc != 0) return mapErrno();
+        if (is_linux) {
+            const rc = linux.unlinkat(dirfd, &p, flags);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.unlinkat(dirfd, &p, @intCast(flags));
+            if (rc != 0) return mapCErrno();
+        }
     }
 
     fn symlinkat(target: anytype, dirfd: posix.fd_t, linkpath: anytype) PosixError!void {
         const t = toPosixPath(target);
         const l = toPosixPath(linkpath);
-        const rc = c.symlinkat(&t, dirfd, &l);
-        if (rc != 0) return mapErrno();
+        if (is_linux) {
+            const rc = linux.symlinkat(&t, dirfd, &l);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.symlinkat(&t, dirfd, &l);
+            if (rc != 0) return mapCErrno();
+        }
     }
 
     fn toPosixPath(path: anytype) [posix.PATH_MAX - 1:0]u8 {
@@ -136,27 +275,62 @@ const posix_compat = struct {
 
     fn clock_getres(clk_id: posix.clockid_t) PosixError!posix.timespec {
         var ts: posix.timespec = undefined;
-        const rc = c.clock_getres(clk_id, &ts);
-        if (rc != 0) return mapErrno();
+        if (is_linux) {
+            const rc = linux.clock_getres(clk_id, &ts);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.clock_getres(clk_id, &ts);
+            if (rc != 0) return mapCErrno();
+        }
         return ts;
     }
 
     fn clock_gettime(clk_id: posix.clockid_t) PosixError!posix.timespec {
         var ts: posix.timespec = undefined;
-        const rc = c.clock_gettime(clk_id, &ts);
-        if (rc != 0) return mapErrno();
+        if (is_linux) {
+            const rc = linux.clock_gettime(clk_id, &ts);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        } else {
+            const rc = c.clock_gettime(clk_id, &ts);
+            if (rc != 0) return mapCErrno();
+        }
         return ts;
     }
 
     fn open(path: anytype, flags: std.posix.O, mode: posix.mode_t) PosixError!posix.fd_t {
         const p = toPosixPath(path);
-        const rc = c.open(&p, flags, mode);
-        if (rc == -1) return mapErrno();
-        return rc;
+        if (is_linux) {
+            const rc = linux.open(&p, flags, mode);
+            const err = posix.errno(rc);
+            if (err != .SUCCESS) return mapLinuxErrno(rc);
+            return @intCast(rc);
+        } else {
+            const rc = c.open(&p, flags, mode);
+            if (rc == -1) return mapCErrno();
+            return rc;
+        }
     }
 
     fn random_bytes(buf: []u8) void {
-        c.arc4random_buf(buf.ptr, buf.len);
+        if (is_linux) {
+            // Use getrandom syscall on Linux (arc4random_buf may not be available)
+            _ = linux.getrandom(buf.ptr, buf.len, 0);
+        } else {
+            c.arc4random_buf(buf.ptr, buf.len);
+        }
+    }
+
+    fn getcwd(buffer: []u8) PosixError![]const u8 {
+        if (is_linux) {
+            const rc = linux.getcwd(buffer.ptr, buffer.len);
+            if (posix.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+            const len = std.mem.indexOfScalar(u8, buffer, 0) orelse buffer.len;
+            return buffer[0..len];
+        } else {
+            const cwd_ptr = c.getcwd(buffer.ptr, buffer.len) orelse return mapCErrno();
+            const len = std.mem.indexOfScalar(u8, cwd_ptr[0..buffer.len], 0) orelse buffer.len;
+            return cwd_ptr[0..len];
+        }
     }
 };
 
@@ -204,9 +378,8 @@ const WasiContext = struct {
 
         {
             var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const cwd_ptr = std.c.getcwd(&cwd_buffer, cwd_buffer.len) orelse return error.Unexpected;
-            const cwd_len = std.mem.indexOfScalar(u8, cwd_ptr[0..cwd_buffer.len], 0) orelse cwd_buffer.len;
-            context.cwd = try context.strings.put(cwd_ptr[0..cwd_len]);
+            const cwd = posix_compat.getcwd(&cwd_buffer) catch return error.Unexpected;
+            context.cwd = try context.strings.put(cwd);
         }
 
         if (opts.argv) |argv| {
@@ -792,13 +965,13 @@ const WindowsApi = struct {
 const Linux = struct {
     const clockid_t = std.posix.clockid_t;
     const timespec = std.posix.timespec;
-    // copy of std.os.linux function, but with a bugfix for the system.clock_getres call. Delete and replace
-    // with the fixed version in a future update
-    pub fn clock_getres(clock_id: clockid_t, res: *timespec) std.posix.ClockGetTimeError!void {
-        switch (std.posix.errno(std.posix.system.clock_getres(@intCast(@intFromEnum(clock_id)), res))) {
+    const ClockError = error{UnsupportedClock} || std.posix.UnexpectedError;
+    pub fn clock_getres(clock_id: clockid_t, res: *timespec) ClockError!void {
+        const rc = std.os.linux.clock_getres(clock_id, res);
+        switch (std.posix.errno(rc)) {
             .SUCCESS => return,
             .FAULT => unreachable,
-            .INVAL => return std.posix.ClockGetTimeError.UnsupportedClock,
+            .INVAL => return error.UnsupportedClock,
             else => |err| return std.posix.unexpectedErrno(err),
         }
     }
@@ -1404,20 +1577,14 @@ const Helpers = struct {
         var stat_wasi: std.os.wasi.filestat_t = undefined;
 
         if (posix_compat.fstat(fd)) |stat| {
-            stat_wasi.dev = if (builtin.os.tag == .macos) @as(u32, @bitCast(stat.dev)) else stat.dev;
+            stat_wasi.dev = stat.dev;
             stat_wasi.ino = stat.ino;
             stat_wasi.filetype = posixModeToWasiFiletype(stat.mode);
             stat_wasi.nlink = stat.nlink;
-            stat_wasi.size = if (std.math.cast(u64, stat.size)) |s| s else 0;
-            if (builtin.os.tag == .macos) {
-                stat_wasi.atim = posixTimespecToWasi(stat.atimespec);
-                stat_wasi.mtim = posixTimespecToWasi(stat.mtimespec);
-                stat_wasi.ctim = posixTimespecToWasi(stat.ctimespec);
-            } else {
-                stat_wasi.atim = posixTimespecToWasi(stat.atim);
-                stat_wasi.mtim = posixTimespecToWasi(stat.mtim);
-                stat_wasi.ctim = posixTimespecToWasi(stat.ctim);
-            }
+            stat_wasi.size = stat.size;
+            stat_wasi.atim = posixTimespecToWasi(stat.atim);
+            stat_wasi.mtim = posixTimespecToWasi(stat.mtim);
+            stat_wasi.ctim = posixTimespecToWasi(stat.ctim);
         } else |err| {
             errno.* = Errno.translateError(err);
         }

@@ -750,6 +750,7 @@ pub const DataDefinition = struct {
         const num_bytes = try decodeLEB128(u32, reader);
         var bytes = std.array_list.Managed(u8).init(allocator);
         try bytes.resize(num_bytes);
+        errdefer bytes.deinit();
         const num_read = try readBytes(reader, bytes.items);
         if (num_read != num_bytes) {
             return error.MalformedUnexpectedEnd;
@@ -2924,13 +2925,16 @@ pub const ModuleDefinition = struct {
 
                     const name_length: usize = reader.seek - section_start_pos;
                     const data_length: usize = section_size_bytes - name_length;
-                    try section.data.resize(data_length);
-                    const data_length_read = reader.readSliceShort(section.data.items) catch return error.MalformedUnexpectedEnd;
-                    if (data_length != data_length_read) {
-                        return error.MalformedUnexpectedEnd;
-                    }
 
-                    try self.custom_sections.append(section);
+                    {
+                        errdefer section.data.deinit();
+                        try section.data.resize(data_length);
+                        const data_length_read = reader.readSliceShort(section.data.items) catch return error.MalformedUnexpectedEnd;
+                        if (data_length != data_length_read) {
+                            return error.MalformedUnexpectedEnd;
+                        }
+                        try self.custom_sections.append(section);
+                    }
 
                     if (std.mem.eql(u8, section.name, "name")) {
                         try self.name_section.decode(self, section.data.items);
@@ -3526,7 +3530,8 @@ pub const ModuleDefinition = struct {
 
                     var data_index: u32 = 0;
                     while (data_index < num_datas) : (data_index += 1) {
-                        const data = try DataDefinition.decode(reader, self, allocator);
+                        var data = try DataDefinition.decode(reader, self, allocator);
+                        errdefer data.bytes.deinit();
                         try self.datas.append(data);
                     }
                 },

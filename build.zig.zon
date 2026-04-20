@@ -4,8 +4,8 @@
     .fingerprint = 0x5a2a0eadb1367749,
     .dependencies = .{
         .stable_array = .{
-            .url = "git+https://github.com/lukewilliamboswell/zig-stable-array.git#98e6224ff7db9853cbd284ac199affd220617007",
-            .hash = "stable_array-0.1.0-3ihgvUVbAADlJAqXJOXZ2xEIHUY5-32i8d6fk7hraKju",
+            .url = "git+https://github.com/lukewilliamboswell/zig-stable-array.git#727b74bc223ddcedcf9201ec0952e57963649efd",
+            .hash = "stable_array-0.1.0-3ihgvTFbAAAduZIruCYsxVwc2nWci42weBHshok2iRhM",
         },
     },
     .minimum_zig_version = "0.16.0",
