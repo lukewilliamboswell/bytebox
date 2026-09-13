@@ -844,10 +844,10 @@ pub const BlockImmediates = struct {
 };
 
 pub const IfImmediates = struct {
+    // Absolute Else instruction index for If, or End index for IfNoElse.
+    // An Else instruction carries the matching End index.
+    continuation: u32,
     num_returns: u16,
-    else_continuation_relative: u16,
-    end_continuation_relative: u16,
-    _pad: u16 = undefined,
 };
 
 pub const InstructionImmediates = union {
@@ -1064,8 +1064,7 @@ pub const Instruction = struct {
                 immediate = InstructionImmediates{
                     .If = IfImmediates{
                         .num_returns = block_immediates.Block.num_returns,
-                        .else_continuation_relative = std.math.maxInt(u16),
-                        .end_continuation_relative = std.math.maxInt(u16),
+                        .continuation = std.math.maxInt(u32),
                     },
                 };
             },
@@ -3454,7 +3453,7 @@ pub const ModuleDefinition = struct {
                                 try if_to_else_offsets.putNoClobber(block.begin_index, instruction_index);
                                 // the else gets the matching if's immediates
                                 instruction.immediate = instructions.items[block.begin_index].immediate;
-                                // and the if will have its else_continuation updated when .End is parsed
+                                // and the if will have its continuation updated when .End is parsed
                             } else if (instruction.opcode == .End) {
                                 const block: BlockData = block_stack.orderedRemove(block_stack.items.len - 1);
                                 if (block_stack.items.len == 0) {
@@ -3475,8 +3474,7 @@ pub const ModuleDefinition = struct {
                                         switch (block_instruction.opcode) {
                                             .Block => block_instruction.immediate.Block.continuation = instruction_index,
                                             .If => {
-                                                block_instruction.immediate.If.end_continuation_relative = @intCast(instruction_index - block.begin_index);
-                                                block_instruction.immediate.If.else_continuation_relative = @intCast(instruction_index - block.begin_index);
+                                                block_instruction.immediate.If.continuation = instruction_index;
                                             },
                                             else => unreachable,
                                         }
@@ -3486,7 +3484,7 @@ pub const ModuleDefinition = struct {
                                             var else_instruction: *Instruction = &instructions.items[else_instruction_index];
                                             std.debug.assert(else_instruction.opcode == .Else);
 
-                                            block_instruction.immediate.If.else_continuation_relative = @intCast(else_instruction_index - block.begin_index);
+                                            block_instruction.immediate.If.continuation = else_instruction_index;
                                             else_instruction.immediate = InstructionImmediates{ .Index = instruction_index };
                                         } else if (block_instruction.opcode == .If) {
                                             block_instruction.opcode = .IfNoElse;

@@ -132,11 +132,11 @@ pub fn @"if"(pc: u32, code: [*]const Instruction, stack: *Stack) u32 {
 
     const condition = stack.popI32();
     if (condition != 0) {
-        stack.pushLabel(immediate.num_returns, pc + immediate.end_continuation_relative);
+        stack.pushLabel(immediate.num_returns, code[immediate.continuation].immediate.Index);
         next_pc = pc + 1;
     } else {
-        stack.pushLabel(immediate.num_returns, pc + immediate.end_continuation_relative);
-        next_pc = pc + immediate.else_continuation_relative + 1;
+        stack.pushLabel(immediate.num_returns, code[immediate.continuation].immediate.Index);
+        next_pc = immediate.continuation + 1;
     }
     return next_pc;
 }
@@ -148,10 +148,10 @@ pub fn ifNoElse(pc: u32, code: [*]const Instruction, stack: *Stack) u32 {
 
     const condition = stack.popI32();
     if (condition != 0) {
-        stack.pushLabel(immediate.num_returns, pc + immediate.end_continuation_relative);
+        stack.pushLabel(immediate.num_returns, immediate.continuation);
         next_pc = pc + 1;
     } else {
-        next_pc = pc + immediate.end_continuation_relative + 1;
+        next_pc = immediate.continuation + 1;
     }
 
     return next_pc;

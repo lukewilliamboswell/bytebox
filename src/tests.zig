@@ -179,3 +179,64 @@ test "MemoryInstance.Internal.growAbsolute" {
         try expectEqual(memory.size(), 25);
     }
 }
+
+fn appendTestU32(bytes: *std.ArrayList(u8), value: u32) !void {
+    var remaining = value;
+    while (true) {
+        const low: u8 = @intCast(remaining & 0x7f);
+        remaining >>= 7;
+        try bytes.append(testing.allocator, low | @as(u8, if (remaining == 0) 0 else 0x80));
+        if (remaining == 0) return;
+    }
+}
+
+fn appendTestSection(bytes: *std.ArrayList(u8), id: u8, payload: []const u8) !void {
+    try bytes.append(testing.allocator, id);
+    try appendTestU32(bytes, @intCast(payload.len));
+    try bytes.appendSlice(testing.allocator, payload);
+}
+
+test "StackVM.If continuations exceed 65535 instructions" {
+    const allocator = testing.allocator;
+    for ([_]bool{ false, true }) |has_else| {
+        for ([_]bool{ false, true }) |branch_to_end| {
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(allocator);
+            // One i32 local, then if (parameter) { local = 11; ... }.
+            try body.appendSlice(allocator, &.{ 1, 1, 0x7f, 0x20, 0, 0x04, 0x40, 0x41, 11, 0x21, 1 });
+            if (branch_to_end) try body.appendSlice(allocator, &.{ 0x0c, 0 });
+            for (0..40000) |_| try body.appendSlice(allocator, &.{ 0x41, 0, 0x1a });
+            if (has_else) {
+                try body.appendSlice(allocator, &.{ 0x05, 0x41, 22, 0x21, 1 });
+                if (branch_to_end) try body.appendSlice(allocator, &.{ 0x0c, 0 });
+                for (0..40000) |_| try body.appendSlice(allocator, &.{ 0x41, 0, 0x1a });
+            }
+            try body.appendSlice(allocator, &.{ 0x0b, 0x20, 1, 0x0b });
+            var code: std.ArrayList(u8) = .empty;
+            defer code.deinit(allocator);
+            try code.append(allocator, 1);
+            try appendTestU32(&code, @intCast(body.items.len));
+            try code.appendSlice(allocator, body.items);
+            var wasm: std.ArrayList(u8) = .empty;
+            defer wasm.deinit(allocator);
+            try wasm.appendSlice(allocator, "\x00asm\x01\x00\x00\x00");
+            try appendTestSection(&wasm, 1, &.{ 1, 0x60, 1, 0x7f, 1, 0x7f });
+            try appendTestSection(&wasm, 3, &.{ 1, 0 });
+            try appendTestSection(&wasm, 7, &.{ 1, 3, 'r', 'u', 'n', 0, 0 });
+            try appendTestSection(&wasm, 10, code.items);
+            const module = try core.createModuleDefinition(allocator, .{});
+            defer module.destroy();
+            try module.decode(wasm.items);
+            const instance = try core.createModuleInstance(.Stack, module, allocator);
+            defer instance.destroy();
+            try instance.instantiate(.{});
+            const handle = try instance.getFunctionHandle("run");
+            for ([_]i32{ 0, 1 }) |condition| {
+                var params = [_]core.Val{.{ .I32 = condition }};
+                var returns = [_]core.Val{.{ .I32 = -1 }};
+                try instance.invoke(handle, &params, &returns, .{});
+                try expectEqual(@as(i32, if (condition != 0) 11 else if (has_else) 22 else 0), returns[0].I32);
+            }
+        }
+    }
+}
