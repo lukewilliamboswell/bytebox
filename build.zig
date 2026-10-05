@@ -15,6 +15,8 @@ const ExeOpts = struct {
     step_dependencies: ?[]const *Build.Step = null,
     emit_asm_step: ?*Build.Step = null,
     options: *Build.Step.Options,
+    inputs: ?*Build.Step.Options = null,
+    strip: ?bool = null,
 };
 
 const StackVmKind = enum {
@@ -32,12 +34,13 @@ const WasmBuild = struct {
     install: *Step,
 };
 
-// At the time of this writing, zig's stage2 codegen backend can't handle tailcalls, so we'll default to using LLVM for simplicity
+// LLVM supports both VM dispatch implementations.
 const use_llvm = true;
 
 pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Omit debug information");
 
     const enable_metering = b.option(bool, "meter", "Enable metering (default: false)") orelse false;
     const enable_debug_trace = b.option(bool, "debug_trace", "Enable debug tracing feature (default: false)") orelse false;
@@ -95,8 +98,14 @@ pub fn build(b: *Build) void {
         .always_install = true,
         .emit_asm_step = emit_asm_step,
         .options = options,
+        .strip = strip,
     });
 
+    const benchmark_inputs = b.addOptions();
+    benchmark_inputs.addOptionPath("add_one", add_one_wasm.compile.getEmittedBin());
+    benchmark_inputs.addOptionPath("fibonacci", fibonacci_wasm.compile.getEmittedBin());
+    benchmark_inputs.addOptionPath("mandelbrot", mandelbrot_wasm.compile.getEmittedBin());
+    benchmark_inputs.addOptionPath("json", json_wasm.compile.getEmittedBin());
     _ = buildExeWithRunStep(b, target, optimize, &imports, .{
         .exe_name = "bench",
         .root_src = "bench/main.zig",
@@ -109,6 +118,8 @@ pub fn build(b: *Build) void {
             json_wasm.install,
         },
         .options = options,
+        .inputs = benchmark_inputs,
+        .strip = strip,
     });
 
     const lib_bytebox: *Compile = b.addLibrary(.{
@@ -137,6 +148,23 @@ pub fn build(b: *Build) void {
     });
     unit_tests.root_module.addImport(stable_array_import.name, stable_array_import.module);
     unit_tests.root_module.addOptions("config", options);
+    const unit_test_inputs = b.addOptions();
+    unit_test_inputs.addOptionPath("fibonacci", fibonacci_wasm.compile.getEmittedBin());
+    unit_test_inputs.addOptionPath("mandelbrot", mandelbrot_wasm.compile.getEmittedBin());
+    unit_tests.root_module.addOptions("test_inputs", unit_test_inputs);
+
+    const core_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/regression_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = use_llvm,
+    });
+    core_tests.root_module.addImport(stable_array_import.name, stable_array_import.module);
+    core_tests.root_module.addOptions("config", options);
+    const run_core_tests = b.addRunArtifact(core_tests);
+    b.step("test-core", "Run decoding, SIMD ABI, and wide-continuation regressions").dependOn(&run_core_tests.step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     run_unit_tests.step.dependOn(fibonacci_wasm.install);
@@ -167,6 +195,8 @@ pub fn build(b: *Build) void {
 
     // mem64 test
     const compile_mem64_test: WasmBuild = buildWasmExe(b, "test/mem64/memtest.zig", .wasm64);
+    const mem64_inputs = b.addOptions();
+    mem64_inputs.addOptionPath("module", compile_mem64_test.compile.getEmittedBin());
 
     const mem64_test_step: *Build.Step = buildExeWithRunStep(b, target, optimize, &imports, .{
         .exe_name = "test-mem64",
@@ -174,6 +204,8 @@ pub fn build(b: *Build) void {
         .step_name = "test-mem64",
         .description = "Run the mem64 test",
         .options = options,
+        .inputs = mem64_inputs,
+        .strip = strip,
         .step_dependencies = &.{compile_mem64_test.install},
     });
 
@@ -190,7 +222,7 @@ pub fn build(b: *Build) void {
     cffi_test.root_module.addCSourceFile(.{
         .file = b.path("test/cffi/main.c"),
     });
-    cffi_test.root_module.addIncludePath(b.path("src/bytebox.h"));
+    cffi_test.root_module.addIncludePath(b.path("src"));
     cffi_test.root_module.linkLibrary(lib_bytebox);
 
     const ffi_guest: WasmBuild = buildWasmExe(b, "test/cffi/module.zig", .wasm32);
@@ -219,6 +251,7 @@ fn buildExeWithRunStep(b: *Build, target: Build.ResolvedTarget, optimize: std.bu
             .root_source_file = b.path(opts.root_src),
             .target = target,
             .optimize = optimize,
+            .strip = opts.strip,
         }),
         .use_llvm = use_llvm,
     });
@@ -227,6 +260,7 @@ fn buildExeWithRunStep(b: *Build, target: Build.ResolvedTarget, optimize: std.bu
         exe.root_module.addImport(import.name, import.module);
     }
     exe.root_module.addOptions("config", opts.options);
+    if (opts.inputs) |inputs| exe.root_module.addOptions("inputs", inputs);
 
     if (opts.emit_asm_step) |asm_step| {
         const asm_filename = std.fmt.allocPrint(b.allocator, "{s}.asm", .{opts.exe_name}) catch unreachable;
@@ -241,9 +275,7 @@ fn buildExeWithRunStep(b: *Build, target: Build.ResolvedTarget, optimize: std.bu
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run.addArgs(args);
-    }
+    run.addPassthruArgs();
 
     const install_exe = b.addInstallArtifact(exe, .{});
 
@@ -268,20 +300,20 @@ fn buildWasmExe(b: *Build, filepath: []const u8, comptime arch: WasmArch) WasmBu
         .cpu_arch = cpu_arch,
         .os_tag = .freestanding,
     };
-    target_query.cpu_features_add.addFeature(@intFromEnum(std.Target.wasm.Feature.bulk_memory));
-    target_query.cpu_features_add.addFeature(@intFromEnum(std.Target.wasm.Feature.nontrapping_fptoint));
-    target_query.cpu_features_add.addFeature(@intFromEnum(std.Target.wasm.Feature.multivalue));
-    target_query.cpu_features_add.addFeature(@intFromEnum(std.Target.wasm.Feature.mutable_globals));
-    target_query.cpu_features_add.addFeature(@intFromEnum(std.Target.wasm.Feature.reference_types));
-    target_query.cpu_features_add.addFeature(@intFromEnum(std.Target.wasm.Feature.sign_ext));
-    target_query.cpu_features_add.addFeature(@intFromEnum(std.Target.wasm.Feature.simd128));
+    target_query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.bulk_memory));
+    target_query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.nontrapping_fptoint));
+    target_query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.multivalue));
+    target_query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.mutable_globals));
+    target_query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.reference_types));
+    target_query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.sign_ext));
+    target_query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.simd128));
 
     var exe = b.addExecutable(.{
         .name = filename_no_extension,
         .root_module = b.createModule(.{
             .root_source_file = b.path(filepath),
             .target = b.resolveTargetQuery(target_query),
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         }),
         .use_llvm = use_llvm,
     });

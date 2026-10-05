@@ -36,7 +36,7 @@ const StackVal = extern union {
     ExternRef: ExternRef,
 
     comptime {
-        if (builtin.mode == .ReleaseFast) {
+        if (builtin.mode == .fast) {
             std.debug.assert(@sizeOf(StackVal) == 8);
         }
     }

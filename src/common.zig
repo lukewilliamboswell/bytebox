@@ -41,7 +41,7 @@ pub const Logger = struct {
     pub fn log(self: Logger, level: LogLevel, comptime format: []const u8, args: anytype) void {
         if (self.log_fn) |logger| {
             var buf: [2048]u8 = undefined;
-            const formatted = std.fmt.bufPrintZ(&buf, format ++ "\n", args) catch |e| {
+            const formatted = std.mem.printSentinel(&buf, format ++ "\n", args, 0) catch |e| {
                 std.debug.print("Failed logging due to error: {}\n", .{e});
                 return;
             };

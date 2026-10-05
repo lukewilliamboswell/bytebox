@@ -22,7 +22,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Setup Python
         uses: actions/setup-python@v4
@@ -53,7 +53,7 @@ jobs:
 
       - name: Bench
         run: |
-          zig build bench -Dvm_kind=${{ matrix.stack_kind }} -Doptimize=ReleaseFast
+          zig build bench -Dvm_kind=${{ matrix.stack_kind }} -Doptimize=ReleaseFast -Dstrip=false
 
       - name: 32-bit builds
         if: runner.os == 'Linux'

@@ -51,6 +51,13 @@ union bb_val
 	int64_t i64_val;
 	float f32_val;
 	double f64_val;
+#if defined(__cplusplus)
+	alignas(16)
+#elif defined(_MSC_VER)
+	__declspec(align(16))
+#else
+	_Alignas(16)
+#endif
 	bb_v128 v128_val;
 	uint32_t externref_val;
 };

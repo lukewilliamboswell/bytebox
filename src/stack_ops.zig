@@ -3238,7 +3238,7 @@ fn vectorAbs(comptime T: type, stack: *Stack) void {
 fn vectorAvgrU(comptime T: type, stack: *Stack) void {
     const type_info = @typeInfo(T).vector;
     const child_type = type_info.child;
-    const type_big_width = std.meta.Int(.unsigned, @bitSizeOf(child_type) * 2);
+    const type_big_width = @Int(.unsigned, @bitSizeOf(child_type) * 2);
 
     const v1: [type_info.len]child_type = @as(T, @bitCast(stack.popV128()));
     const v2: [type_info.len]child_type = @as(T, @bitCast(stack.popV128()));
@@ -3274,7 +3274,7 @@ fn vectorBoolOp(comptime T: type, comptime op: VectorBoolOp, stack: *Stack) void
     };
     const vec_type_info = @typeInfo(T).vector;
 
-    const no_bits: std.meta.Int(.unsigned, @bitSizeOf(vec_type_info.child)) = 0;
+    const no_bits: @Int(.unsigned, @bitSizeOf(vec_type_info.child)) = 0;
     const yes_bits = ~no_bits;
 
     const yes_vec: T = @splat(@bitCast(yes_bits));
@@ -3322,7 +3322,7 @@ fn vectorBitmask(comptime T: type, vec: v128) i32 {
         const high_bit: u8 = 1 << (@bitSizeOf(u8) - 1);
         const high_bits_mask: @Vector(16, u8) = @splat(high_bit);
 
-        const shift_type = std.meta.Int(.unsigned, std.math.log2(@bitSizeOf(u16)));
+        const shift_type = @Int(.unsigned, std.math.log2(@bitSizeOf(u16)));
         const shifts_left: @Vector(16, shift_type) = @splat(8);
         var shifts_right_array: [16]shift_type = undefined;
         for (&shifts_right_array, 0..) |*element, i| {
@@ -3340,12 +3340,12 @@ fn vectorBitmask(comptime T: type, vec: v128) i32 {
         return bitmask;
     } else {
         const vec_len = @typeInfo(T).vector.len;
-        const int_type: type = std.meta.Int(.unsigned, @bitSizeOf(child_type));
+        const int_type: type = @Int(.unsigned, @bitSizeOf(child_type));
 
         const high_bit: int_type = 1 << (@bitSizeOf(int_type) - 1);
         const high_bits_mask: @Vector(vec_len, int_type) = @splat(high_bit);
 
-        const shift_type = std.meta.Int(.unsigned, std.math.log2(@bitSizeOf(int_type)));
+        const shift_type = @Int(.unsigned, std.math.log2(@bitSizeOf(int_type)));
         var shifts_right_array: [vec_len]shift_type = undefined;
         for (&shifts_right_array, 0..) |*element, i| {
             element.* = @as(shift_type, @intCast((@bitSizeOf(int_type) - 1) - i));

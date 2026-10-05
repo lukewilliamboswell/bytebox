@@ -7,13 +7,18 @@ const Limits = core.Limits;
 const MemoryInstance = core.MemoryInstance;
 
 const metering = @import("metering.zig");
+const test_inputs = @import("test_inputs");
+
+test {
+    _ = @import("regression_tests.zig");
+}
 
 test "StackVM.Integration" {
-    const wasm_filepath = "zig-out/bin/mandelbrot.wasm";
+    const wasm_filepath = test_inputs.mandelbrot;
 
     var allocator = std.testing.allocator;
 
-    const wasm_data: []u8 = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, wasm_filepath, allocator, .limited(1024 * 1024 * 128));
+    const wasm_data: []u8 = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, wasm_filepath, allocator, .limited(1024 * 1024 * 128));
     defer allocator.free(wasm_data);
 
     const module_def_opts = core.ModuleDefinitionOpts{
@@ -32,11 +37,11 @@ test "StackVM.Metering" {
     if (!metering.enabled) {
         return;
     }
-    const wasm_filepath = "zig-out/bin/fibonacci.wasm";
+    const wasm_filepath = test_inputs.fibonacci;
 
     var allocator = std.testing.allocator;
 
-    const wasm_data: []u8 = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, wasm_filepath, allocator, .limited(1024 * 1024 * 128));
+    const wasm_data: []u8 = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, wasm_filepath, allocator, .limited(1024 * 1024 * 128));
     defer allocator.free(wasm_data);
 
     const module_def_opts = core.ModuleDefinitionOpts{

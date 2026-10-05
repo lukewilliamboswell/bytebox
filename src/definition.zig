@@ -95,9 +95,9 @@ const k_function_type_sentinel_byte: u8 = 0x60;
 const k_block_type_void_sentinel_byte: u8 = 0x40;
 
 fn intToEnum(comptime E: type, value: @typeInfo(E).@"enum".tag_type) ?E {
-    const fields = @typeInfo(E).@"enum".fields;
-    inline for (fields) |field| {
-        if (field.value == value) return @enumFromInt(value);
+    const values = @typeInfo(E).@"enum".field_values;
+    inline for (values) |field_value| {
+        if (field_value == value) return @fromBackingInt(@intCast(value));
     }
     return null;
 }
@@ -221,7 +221,7 @@ pub const ValType = enum(c_int) {
     }
 
     pub fn count() comptime_int {
-        return @typeInfo(ValType).Enum.fields.len;
+        return @typeInfo(ValType).@"enum".field_names.len;
     }
 };
 
@@ -251,12 +251,14 @@ pub const FuncRef = extern union {
 
 pub const ExternRef = usize;
 
+// Zig 0.17 requires an explicit C-compatible representation for extern
+// vectors. Array storage preserves union reinterpretation used by VM marshalling.
 pub const Val = extern union {
     I32: i32,
     I64: i64,
     F32: f32,
     F64: f64,
-    V128: v128,
+    V128: [4]f32 align(16),
     FuncRef: FuncRef,
     ExternRef: ExternRef,
 
@@ -295,7 +297,7 @@ pub const Val = extern union {
             .I64 => v1.I64 == v2.I64,
             .F32 => v1.F32 == v2.F32,
             .F64 => v1.F64 == v2.F64,
-            .V128 => @reduce(.And, v1.V128 == v2.V128),
+            .V128 => @reduce(.And, @as(v128, v1.V128) == @as(v128, v2.V128)),
             .FuncRef => v1.FuncRef.index == v2.FuncRef.index,
             .ExternRef => v1.ExternRef == v2.ExternRef,
         };
@@ -540,7 +542,7 @@ pub const ConstantExpression = union(ConstantExpressionType) {
             }
         }
 
-        const end = @as(WasmOpcode, @enumFromInt(try readByte(reader)));
+        const end = @as(WasmOpcode, @fromBackingInt(@intCast(try readByte(reader))));
         if (end != .End) {
             return error.ValidationBadConstantExpression;
         }
@@ -866,7 +868,7 @@ pub const InstructionImmediates = union {
     If: IfImmediates,
 
     comptime {
-        if (builtin.mode == .ReleaseFast) {
+        if (builtin.mode == .fast) {
             std.debug.assert(@sizeOf(BlockImmediates) == 8);
             std.debug.assert(@sizeOf(CallIndirectImmediates) == 8);
             std.debug.assert(@sizeOf(TablePairImmediates) == 8);
@@ -894,7 +896,7 @@ pub const Instruction = struct {
     immediate: InstructionImmediates,
 
     comptime {
-        if (builtin.mode == .ReleaseFast) {
+        if (builtin.mode == .fast) {
             std.debug.assert(@sizeOf(Instruction) == 16);
         }
     }
@@ -3208,7 +3210,7 @@ pub const ModuleDefinition = struct {
                             }
                         }
 
-                        const exportType = @as(ExportType, @enumFromInt(try readByte(reader)));
+                        const exportType = @as(ExportType, @fromBackingInt(@intCast(try readByte(reader))));
                         const item_index = try decodeLEB128(u32, reader);
                         const def = ExportDefinition{ .name = name, .index = item_index };
 

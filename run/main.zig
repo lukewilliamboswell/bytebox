@@ -429,6 +429,6 @@ fn writeSignature(writer: *std.Io.Writer, info: *const bytebox.FunctionExport) !
 
 fn valtypeToString(valtype: ValType) []const u8 {
     return switch (valtype) {
-        inline else => |v| @typeInfo(ValType).@"enum".fields[@intFromEnum(v)].name,
+        inline else => |v| @typeInfo(ValType).@"enum".field_names[@backingInt(v)],
     };
 }

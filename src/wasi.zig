@@ -31,7 +31,7 @@ const posix_compat = struct {
     }
 
     fn mapCErrno() PosixError {
-        return mapE(@enumFromInt(c._errno().*));
+        return mapE(@fromBackingInt(@intCast(c._errno().*)));
     }
 
     fn mapE(e: c.E) PosixError {
@@ -696,7 +696,7 @@ const WasiContext = struct {
 
     fn fromUserdata(userdata: ?*anyopaque) *WasiContext {
         std.debug.assert(userdata != null);
-        return @as(*WasiContext, @alignCast(@ptrCast(userdata.?)));
+        return @as(*WasiContext, @ptrCast(@alignCast(userdata.?)));
     }
 };
 
@@ -1016,7 +1016,7 @@ const Helpers = struct {
     }
 
     fn writeFilestatToMemory(stat: *const std.os.wasi.filestat_t, offset: u32, module: *ModuleInstance, errno: *Errno) void {
-        const filetype = @intFromEnum(stat.filetype);
+        const filetype = @backingInt(stat.filetype);
         Helpers.writeIntToMemory(u64, stat.dev, offset + 0, module, errno);
         Helpers.writeIntToMemory(u64, stat.ino, offset + 8, module, errno);
         Helpers.writeIntToMemory(u8, filetype, offset + 16, module, errno);
@@ -1048,7 +1048,7 @@ const Helpers = struct {
             writeIntToMemory(u32, strings_length, dest_string_length, module, &errno);
         }
 
-        returns[0] = Val{ .I32 = @intFromEnum(errno) };
+        returns[0] = Val{ .I32 = @backingInt(errno) };
     }
 
     fn stringsGet(module: *ModuleInstance, strings: [][]const u8, params: [*]const Val, returns: [*]Val) void {
@@ -1074,13 +1074,13 @@ const Helpers = struct {
             }
         }
 
-        returns[0] = Val{ .I32 = @intFromEnum(errno) };
+        returns[0] = Val{ .I32 = @backingInt(errno) };
     }
 
     const ClockId = if (builtin.os.tag == .windows) i32 else std.posix.clockid_t;
 
     fn convertClockId(wasi_clockid: i32) ClockId {
-        const clockid_t: std.os.wasi.clockid_t = @enumFromInt(wasi_clockid);
+        const clockid_t: std.os.wasi.clockid_t = @fromBackingInt(@intCast(wasi_clockid));
         return switch (clockid_t) {
             std.os.wasi.clockid_t.REALTIME => if (builtin.os.tag != .windows) std.posix.CLOCK.REALTIME else WindowsApi.CLOCK.REALTIME,
             std.os.wasi.clockid_t.MONOTONIC => if (builtin.os.tag != .windows) std.posix.CLOCK.MONOTONIC else WindowsApi.CLOCK.MONOTONIC,
@@ -1781,7 +1781,7 @@ const Helpers = struct {
                     writer.writeInt(u64, cookie, .little) catch break;
                     writer.writeInt(u64, entry.inode, .little) catch break;
                     writer.writeInt(u32, signedCast(u32, entry.filename.len, errno), .little) catch break;
-                    writer.writeInt(u32, @intFromEnum(entry.filetype), .little) catch break;
+                    writer.writeInt(u32, @backingInt(entry.filetype), .little) catch break;
                     writer.writeAll(entry.filename) catch break;
 
                     file_index += 1;
@@ -2082,7 +2082,7 @@ fn wasi_clock_res_get(_: ?*anyopaque, module: *ModuleInstance, params: [*]const 
     if (errno == .SUCCESS) {
         var freqency_ns: u64 = 0;
         if (builtin.os.tag == .windows) {
-            const clockid: std.os.wasi.clockid_t = @enumFromInt(system_clockid);
+            const clockid: std.os.wasi.clockid_t = @fromBackingInt(@intCast(system_clockid));
             // Follow the mingw pattern since clock_getres() isn't linked in libc for windows
             if (clockid == std.os.wasi.clockid_t.REALTIME or clockid == std.os.wasi.clockid_t.MONOTONIC) {
                 const ns_per_second: u64 = 1000000000;
@@ -2119,7 +2119,7 @@ fn wasi_clock_res_get(_: ?*anyopaque, module: *ModuleInstance, params: [*]const 
         Helpers.writeIntToMemory(u64, freqency_ns, timestamp_mem_begin, module, &errno);
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn wasi_clock_time_get(_: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2134,7 +2134,7 @@ fn wasi_clock_time_get(_: ?*anyopaque, module: *ModuleInstance, params: [*]const
         var timestamp_ns: u64 = 0;
 
         if (builtin.os.tag == .windows) {
-            const clockid: std.os.wasi.clockid_t = @enumFromInt(system_clockid);
+            const clockid: std.os.wasi.clockid_t = @fromBackingInt(@intCast(system_clockid));
             switch (clockid) {
                 std.os.wasi.clockid_t.REALTIME => {
                     var ft: WindowsApi.FILETIME = undefined;
@@ -2189,7 +2189,7 @@ fn wasi_clock_time_get(_: ?*anyopaque, module: *ModuleInstance, params: [*]const
         Helpers.writeIntToMemory(u64, timestamp_ns, timestamp_mem_begin, module, &errno);
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_datasync(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2204,7 +2204,7 @@ fn fd_wasi_datasync(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const 
         };
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_fdstat_get(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2220,7 +2220,7 @@ fn fd_wasi_fdstat_get(userdata: ?*anyopaque, module: *ModuleInstance, params: [*
             const stat: std.os.wasi.fdstat_t = if (builtin.os.tag == .windows) Helpers.fdstatGetWindows(fd_os, &errno) else Helpers.fdstatGetPosix(fd_os, &errno);
 
             if (errno == .SUCCESS) {
-                Helpers.writeIntToMemory(u8, @intFromEnum(stat.fs_filetype), fdstat_mem_offset + 0, module, &errno);
+                Helpers.writeIntToMemory(u8, @backingInt(stat.fs_filetype), fdstat_mem_offset + 0, module, &errno);
                 Helpers.writeIntToMemory(u16, @bitCast(stat.fs_flags), fdstat_mem_offset + 2, module, &errno);
                 Helpers.writeIntToMemory(u64, @bitCast(stat.fs_rights_base), fdstat_mem_offset + 8, module, &errno);
                 Helpers.writeIntToMemory(u64, @bitCast(stat.fs_rights_inheriting), fdstat_mem_offset + 16, module, &errno);
@@ -2228,7 +2228,7 @@ fn fd_wasi_fdstat_get(userdata: ?*anyopaque, module: *ModuleInstance, params: [*
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_fdstat_set_flags(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2245,7 +2245,7 @@ fn fd_wasi_fdstat_set_flags(userdata: ?*anyopaque, _: *ModuleInstance, params: [
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_prestat_get(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2259,12 +2259,12 @@ fn fd_wasi_prestat_get(userdata: ?*anyopaque, module: *ModuleInstance, params: [
         if (context.fdDirPath(fd_dir_wasi, &errno)) |path_source| {
             const name_len: u32 = @as(u32, @intCast(path_source.len));
 
-            Helpers.writeIntToMemory(u32, @intFromEnum(std.os.wasi.preopentype_t.DIR), prestat_mem_offset + 0, module, &errno);
+            Helpers.writeIntToMemory(u32, @backingInt(std.os.wasi.preopentype_t.DIR), prestat_mem_offset + 0, module, &errno);
             Helpers.writeIntToMemory(u32, name_len, prestat_mem_offset + @sizeOf(u32), module, &errno);
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_prestat_dir_name(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2292,7 +2292,7 @@ fn fd_wasi_prestat_dir_name(userdata: ?*anyopaque, module: *ModuleInstance, para
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_read(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2306,7 +2306,7 @@ fn fd_wasi_read(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const
 
     if (errno == .SUCCESS) {
         if (context.fdLookup(fd_wasi, &errno)) |fd_info| {
-            var stack_iov = [_]std.posix.iovec{undefined} ** 1024;
+            var stack_iov = @as([1024]std.posix.iovec, undefined);
             if (Helpers.initIovecs(std.posix.iovec, &stack_iov, &errno, module, iovec_array_begin, iovec_array_count)) |iov| {
                 if (posix_compat.readv(fd_info.fd, iov)) |read_bytes| {
                     if (read_bytes <= std.math.maxInt(u32)) {
@@ -2321,7 +2321,7 @@ fn fd_wasi_read(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_readdir(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2343,7 +2343,7 @@ fn fd_wasi_readdir(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]co
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_renumber(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2355,7 +2355,7 @@ fn fd_wasi_renumber(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const 
 
     context.fdRenumber(fd_wasi, fd_to_wasi, &errno);
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_pread(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2370,7 +2370,7 @@ fn fd_wasi_pread(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]cons
 
     if (errno == .SUCCESS) {
         if (context.fdLookup(fd_wasi, &errno)) |fd_info| {
-            var stack_iov = [_]std.posix.iovec{undefined} ** 1024;
+            var stack_iov = @as([1024]std.posix.iovec, undefined);
             if (Helpers.initIovecs(std.posix.iovec, &stack_iov, &errno, module, iovec_array_begin, iovec_array_count)) |iov| {
                 if (posix_compat.preadv(fd_info.fd, iov, read_offset)) |read_bytes| {
                     if (read_bytes <= std.math.maxInt(u32)) {
@@ -2385,7 +2385,7 @@ fn fd_wasi_pread(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]cons
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_advise(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2403,7 +2403,7 @@ fn fd_wasi_advise(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Va
             // fadvise isn't available on windows or macos, but fadvise is just an optimization hint, so don't
             // return a bad error code
             if (builtin.os.tag == .linux) {
-                const wasi_advice: std.os.wasi.advice_t = @enumFromInt(advice_wasi);
+                const wasi_advice: std.os.wasi.advice_t = @fromBackingInt(@intCast(advice_wasi));
                 const advice: usize = switch (wasi_advice) {
                     std.os.wasi.advice_t.NORMAL => std.os.linux.POSIX_FADV.NORMAL,
                     std.os.wasi.advice_t.SEQUENTIAL => std.os.linux.POSIX_FADV.SEQUENTIAL,
@@ -2414,7 +2414,7 @@ fn fd_wasi_advise(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Va
                 };
 
                 if (errno == .SUCCESS) {
-                    const ret = @as(std.os.linux.E, @enumFromInt(std.os.linux.fadvise(fd_info.fd, offset, length, advice)));
+                    const ret = @as(std.os.linux.E, @fromBackingInt(@intCast(std.os.linux.fadvise(fd_info.fd, offset, length, advice))));
                     errno = switch (ret) {
                         .SUCCESS => Errno.SUCCESS,
                         .SPIPE => Errno.SPIPE,
@@ -2429,7 +2429,7 @@ fn fd_wasi_advise(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Va
         errno = Errno.BADF;
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_allocate(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2493,7 +2493,7 @@ fn fd_wasi_allocate(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const 
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_close(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2507,7 +2507,7 @@ fn fd_wasi_close(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val
         context.fdClose(fd_wasi, &errno);
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_filestat_get(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2531,7 +2531,7 @@ fn fd_wasi_filestat_get(userdata: ?*anyopaque, module: *ModuleInstance, params: 
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_filestat_set_size(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2551,7 +2551,7 @@ fn fd_wasi_filestat_set_size(userdata: ?*anyopaque, _: *ModuleInstance, params: 
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_filestat_set_times(userdata: ?*anyopaque, _: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2583,7 +2583,7 @@ fn fd_wasi_filestat_set_times(userdata: ?*anyopaque, _: *ModuleInstance, params:
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_seek(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2635,7 +2635,7 @@ fn fd_wasi_seek(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_tell(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2656,7 +2656,7 @@ fn fd_wasi_tell(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_write(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2670,7 +2670,7 @@ fn fd_wasi_write(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]cons
 
     if (errno == .SUCCESS) {
         if (context.fdLookup(fd_wasi, &errno)) |fd_info| {
-            var stack_iov = [_]std.posix.iovec_const{undefined} ** 1024;
+            var stack_iov = @as([1024]std.posix.iovec_const, undefined);
             if (Helpers.initIovecs(std.posix.iovec_const, &stack_iov, &errno, module, iovec_array_begin, iovec_array_count)) |iov| {
                 if (posix_compat.writev(fd_info.fd, iov)) |written_bytes| {
                     Helpers.writeIntToMemory(u32, @as(u32, @intCast(written_bytes)), bytes_written_out_offset, module, &errno);
@@ -2681,7 +2681,7 @@ fn fd_wasi_write(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]cons
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn fd_wasi_pwrite(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2696,7 +2696,7 @@ fn fd_wasi_pwrite(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]con
 
     if (errno == .SUCCESS) {
         if (context.fdLookup(fd_wasi, &errno)) |fd_info| {
-            var stack_iov = [_]std.posix.iovec_const{undefined} ** 1024;
+            var stack_iov = @as([1024]std.posix.iovec_const, undefined);
             if (Helpers.initIovecs(std.posix.iovec_const, &stack_iov, &errno, module, iovec_array_begin, iovec_array_count)) |iov| {
                 if (posix_compat.pwritev(fd_info.fd, iov, write_offset)) |written_bytes| {
                     Helpers.writeIntToMemory(u32, @as(u32, @intCast(written_bytes)), bytes_written_out_offset, module, &errno);
@@ -2707,7 +2707,7 @@ fn fd_wasi_pwrite(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]con
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn wasi_path_create_directory(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2731,7 +2731,7 @@ fn wasi_path_create_directory(userdata: ?*anyopaque, module: *ModuleInstance, pa
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn wasi_path_filestat_get(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2788,7 +2788,7 @@ fn wasi_path_filestat_get(userdata: ?*anyopaque, module: *ModuleInstance, params
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn wasi_path_open(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2826,7 +2826,7 @@ fn wasi_path_open(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]con
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn wasi_path_remove_directory(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2857,7 +2857,7 @@ fn wasi_path_remove_directory(userdata: ?*anyopaque, module: *ModuleInstance, pa
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn wasi_path_symlink(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2911,7 +2911,7 @@ fn wasi_path_symlink(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn wasi_path_unlink_file(userdata: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2942,7 +2942,7 @@ fn wasi_path_unlink_file(userdata: ?*anyopaque, module: *ModuleInstance, params:
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 fn wasi_random_get(_: ?*anyopaque, module: *ModuleInstance, params: [*]const Val, returns: [*]Val) WasiError!void {
@@ -2959,7 +2959,7 @@ fn wasi_random_get(_: ?*anyopaque, module: *ModuleInstance, params: [*]const Val
         }
     }
 
-    returns[0] = Val{ .I32 = @intFromEnum(errno) };
+    returns[0] = Val{ .I32 = @backingInt(errno) };
 }
 
 pub const WasiOpts = struct {

@@ -8,10 +8,11 @@
             .hash = "stable_array-0.1.0-3ihgvd9eAAA5ozV4aOQZ6GI3d_gTyiR9tS6mwav2w18o",
         },
     },
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{
         "src",
         "test/mem64",
+        "test/cffi",
         "test/wasi/run.py",
         "test/wasi/bytebox_adapter.py",
         "test/wasm/main.zig",

@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include "bytebox.h"
 
+_Static_assert(sizeof(bb_val) == 16, "bb_val must match the Zig value size");
+_Static_assert(_Alignof(bb_val) == 16, "bb_val must preserve SIMD alignment");
+
 void magic(void* userdata, bb_module_instance* inst, const bb_val* params, bb_val* returns) {
     int* data = (int* )userdata;
 
@@ -79,7 +82,7 @@ int main(int argc, const char** argv) {
 
     bb_module_instance_invoke_opts invoke_opts = {0};
     bb_val returns[1];
-    err = bb_module_instance_invoke(mod_inst, entry, NULL, 0, &returns, 1, invoke_opts);
+    err = bb_module_instance_invoke(mod_inst, entry, NULL, 0, returns, 1, invoke_opts);
 
     if (err != BB_ERROR_OK) {
         fprintf(stderr, "Error invoking entry: %d %s\n", err, bb_error_str(err));

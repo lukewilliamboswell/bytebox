@@ -7,7 +7,7 @@ pub fn main(process_init: std.process.Init) !void {
 
     const allocator: std.mem.Allocator = process_init.gpa;
 
-    const wasm_data: []u8 = try std.Io.Dir.cwd().readFileAlloc(process_init.io, "zig-out/bin/memtest.wasm", allocator, .limited(1024 * 512));
+    const wasm_data: []u8 = try std.Io.Dir.cwd().readFileAlloc(process_init.io, @import("inputs").module, allocator, .limited(1024 * 512));
     defer allocator.free(wasm_data);
 
     const module_def = try bytebox.createModuleDefinition(allocator, .{});
